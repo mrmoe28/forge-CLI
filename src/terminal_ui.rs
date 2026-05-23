@@ -369,8 +369,6 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
                 Color::Magenta
             }),
         ),
-        Span::raw("   "),
-        Span::styled(&state.status, status_style(&state.status)),
     ]));
     frame.render_widget(header, chunks[0]);
 
@@ -419,11 +417,7 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         cursor_row.saturating_sub(input_scroll),
     );
 
-    let footer = Paragraph::new(
-        "enter send  alt+enter newline  ↑/↓ history  ctrl+w word-del  ctrl+c exit  /help",
-    )
-    .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(footer, chunks[5]);
+    render_status_bar(frame, chunks[5], state);
 
     if let Some(approval) = state.pending_approval.as_ref() {
         render_approval_card(frame, approval);
@@ -698,6 +692,138 @@ fn skills_label(state: &TuiState) -> String {
         return format!("skills: {}", state.skills.len());
     }
     format!("skills: {}", state.session.active_skills.join(","))
+}
+
+fn render_status_bar(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let home = dirs_home();
+    let data = build_status_bar_data(
+        &state.session.short_id(),
+        &state.session.cwd,
+        home.as_deref(),
+        mode_label(state),
+        state.active_run.is_some(),
+        &state.status,
+    );
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let sep = || Span::styled("  ·  ", dim);
+    let run_style = if state.active_run.is_some() {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        dim
+    };
+    let mode_style = if state.session.bypass || state.session.desktop {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let mut left = vec![
+        Span::raw(" "),
+        Span::styled(data.run_state, run_style),
+        sep(),
+        Span::styled(data.session.clone(), Style::default().fg(Color::Cyan)),
+        sep(),
+        Span::styled(data.cwd.clone(), Style::default().fg(Color::White)),
+        sep(),
+        Span::styled(data.mode, mode_style),
+    ];
+
+    // Right-side content: ephemeral message if any, otherwise a brief hint.
+    let right_text = match &data.message {
+        Some(msg) => msg.clone(),
+        None => "enter send  ·  /help".to_string(),
+    };
+    let right_style = match &data.message {
+        Some(msg) => status_style(msg),
+        None => dim,
+    };
+
+    // Left chars used so we can right-align the message manually within `area`.
+    let left_chars: usize = left.iter().map(|span| span.content.chars().count()).sum();
+    let total = area.width as usize;
+    let right_chars = right_text.chars().count();
+    let padding = total
+        .saturating_sub(left_chars)
+        .saturating_sub(right_chars)
+        .saturating_sub(1);
+    if padding > 0 {
+        left.push(Span::raw(" ".repeat(padding)));
+    } else {
+        // Not enough room; drop a separator instead of overflowing.
+        left.push(Span::raw(" "));
+    }
+    left.push(Span::styled(right_text, right_style));
+
+    let bar = Paragraph::new(Line::from(left));
+    frame.render_widget(bar, area);
+}
+
+/// Look up the user's home directory once per frame. Returns `None` when the
+/// environment doesn't expose `HOME` (e.g. in some CI sandboxes).
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// Pure data backing the persistent bottom status bar. Kept separate from
+/// rendering so the layout can be unit-tested without standing up a terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusBarData {
+    run_state: &'static str,
+    session: String,
+    cwd: String,
+    mode: &'static str,
+    /// Ephemeral message (e.g. "Profile switched to dev"). When `None`, the
+    /// renderer falls back to a brief key hint.
+    message: Option<String>,
+}
+
+fn build_status_bar_data(
+    session_short_id: &str,
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+    mode: &'static str,
+    running: bool,
+    ephemeral: &str,
+) -> StatusBarData {
+    let run_state = if running { "● running" } else { "○ idle" };
+    let cwd_display = abbreviate_home(cwd, home);
+    let message = if ephemeral.trim().is_empty() {
+        None
+    } else {
+        Some(ephemeral.to_string())
+    };
+    StatusBarData {
+        run_state,
+        session: format!("session {session_short_id}"),
+        cwd: format!("cwd {cwd_display}"),
+        mode,
+        message,
+    }
+}
+
+/// Replace the user's home prefix with `~` so the cwd fits on a single line.
+/// Returns the original path when `home` is `None` or the prefix doesn't match.
+fn abbreviate_home(cwd: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    let cwd_str = cwd.display().to_string();
+    let Some(home) = home else {
+        return cwd_str;
+    };
+    let home_str = home.display().to_string();
+    if home_str.is_empty() {
+        return cwd_str;
+    }
+    if cwd == home {
+        return "~".to_string();
+    }
+    if let Some(rest) = cwd_str.strip_prefix(&home_str)
+        && rest.starts_with(std::path::MAIN_SEPARATOR)
+    {
+        return format!("~{rest}");
+    }
+    cwd_str
 }
 
 fn set_input_cursor(frame: &mut ratatui::Frame<'_>, area: Rect, col: usize, row: usize) {
@@ -1991,6 +2117,64 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn status_bar_idle_with_home_abbreviated() {
+        let cwd = std::path::PathBuf::from("/home/me/forge-CLI");
+        let home = std::path::PathBuf::from("/home/me");
+        let data = build_status_bar_data("4f3a8b", &cwd, Some(&home), "guarded", false, "");
+        assert_eq!(data.run_state, "○ idle");
+        assert_eq!(data.session, "session 4f3a8b");
+        assert_eq!(data.cwd, "cwd ~/forge-CLI");
+        assert_eq!(data.mode, "guarded");
+        assert!(data.message.is_none(), "no ephemeral status → no message");
+    }
+
+    #[test]
+    fn status_bar_running_shows_running_marker_and_message() {
+        let cwd = std::path::PathBuf::from("/tmp/repo");
+        let data = build_status_bar_data("abcdef", &cwd, None, "bypass", true, "Running…");
+        assert_eq!(data.run_state, "● running");
+        assert_eq!(data.cwd, "cwd /tmp/repo", "no home → keep absolute path");
+        assert_eq!(data.mode, "bypass");
+        assert_eq!(data.message.as_deref(), Some("Running…"));
+    }
+
+    #[test]
+    fn status_bar_trims_whitespace_only_messages() {
+        let cwd = std::path::PathBuf::from("/x");
+        let data = build_status_bar_data("a", &cwd, None, "guarded", false, "   \t  ");
+        assert!(
+            data.message.is_none(),
+            "whitespace-only ephemeral status must collapse to None"
+        );
+    }
+
+    #[test]
+    fn abbreviate_home_handles_exact_match_and_outside_paths() {
+        let home = std::path::PathBuf::from("/home/me");
+        assert_eq!(
+            abbreviate_home(&std::path::PathBuf::from("/home/me"), Some(&home)),
+            "~"
+        );
+        assert_eq!(
+            abbreviate_home(
+                &std::path::PathBuf::from("/home/me/projects/x"),
+                Some(&home)
+            ),
+            "~/projects/x"
+        );
+        // Path outside home is returned verbatim.
+        assert_eq!(
+            abbreviate_home(&std::path::PathBuf::from("/var/log"), Some(&home)),
+            "/var/log"
+        );
+        // Prefix-but-not-segment match must NOT be abbreviated.
+        assert_eq!(
+            abbreviate_home(&std::path::PathBuf::from("/home/megan/repo"), Some(&home)),
+            "/home/megan/repo"
+        );
+    }
 
     #[test]
     fn cancel_returns_false_when_no_active_run() {
