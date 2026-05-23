@@ -305,8 +305,7 @@ async fn interactive_loop(
         .cwd
         .clone()
         .unwrap_or(std::env::current_dir().context("failed to read current directory")?);
-    let mut session =
-        forge_cli::Session::new(args.profile.clone(), session_cwd);
+    let mut session = forge_cli::Session::new(args.profile.clone(), session_cwd);
     session.bypass = args.bypass;
     session.desktop = args.desktop;
     session.timeout_secs = args.timeout_secs;
@@ -320,7 +319,11 @@ async fn interactive_loop(
     };
 
     println!("external agent harness");
-    println!("session {} (profile: {})", plain.session.short_id(), plain.session.profile);
+    println!(
+        "session {} (profile: {})",
+        plain.session.short_id(),
+        plain.session.profile
+    );
     println!(
         "commands: /help, /profile <name>, /skills, /skill <name>, /bypass on|off, /desktop on|off, /runs, /last, /retry [id], /new, /sessions, /resume [id], /fork [id], /exit"
     );
@@ -344,11 +347,23 @@ async fn interactive_loop(
             continue;
         }
 
-        if let Some(command) = slash_command(input) {
-            if handle_interactive_command(&config, &runs_dir, &mut plain, command).await? {
-                return Ok(());
+        match commands::classify_input(input) {
+            commands::InputClass::Command(command) => {
+                if handle_interactive_command(&config, &runs_dir, &mut plain, command).await? {
+                    return Ok(());
+                }
+                continue;
             }
-            continue;
+            commands::InputClass::UnknownSlash(token) => {
+                let hint = commands::fuzzy_search(token)
+                    .first()
+                    .map(|cmd| cmd.name)
+                    .unwrap_or("help");
+                println!("unknown command: /{token}. Try /{hint} (or /help for the full list)");
+                continue;
+            }
+            // Path-looking or plain-prompt input falls through to the agent.
+            commands::InputClass::Path | commands::InputClass::Prompt => {}
         }
 
         plain.session.record_user(input.to_string());
@@ -379,10 +394,9 @@ async fn interactive_loop(
             plain.session.provider_session_id = Some(id.clone());
             println!("captured provider session id: {id}");
         }
-        plain.session.record_assistant(
-            read_transcript_text(&record).await?,
-            record.id.clone(),
-        );
+        plain
+            .session
+            .record_assistant(read_transcript_text(&record).await?, record.id.clone());
         forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
         print_run(&record);
     }
@@ -398,13 +412,15 @@ struct PlainState {
 /// Read just the stdout portion of a completed run so it can be stored on the
 /// session transcript as the assistant turn. The on-disk format from
 /// [`read_transcript`] also includes stderr, which we drop.
-async fn read_transcript_text(
-    record: &forge_cli::RunRecord,
-) -> Result<String> {
+async fn read_transcript_text(record: &forge_cli::RunRecord) -> Result<String> {
     let body = read_transcript(record).await?;
     let stdout = body
         .strip_prefix("stdout:\n")
-        .and_then(|rest| rest.split_once("\n\nstderr:\n").map(|(a, _)| a).or(Some(rest)))
+        .and_then(|rest| {
+            rest.split_once("\n\nstderr:\n")
+                .map(|(a, _)| a)
+                .or(Some(rest))
+        })
         .unwrap_or(body.as_str());
     Ok(stdout.trim_end_matches('\n').to_string())
 }
@@ -474,17 +490,13 @@ async fn handle_interactive_command(
                 if plain.session.active_skills.is_empty() {
                     println!("active skills: none");
                 } else {
-                    println!(
-                        "active skills: {}",
-                        plain.session.active_skills.join(", ")
-                    );
+                    println!("active skills: {}", plain.session.active_skills.join(", "));
                 }
                 return Ok(false);
             };
             if matches!(name, "off" | "clear" | "none") {
                 plain.session.active_skills.clear();
-                forge_cli::save_session(&plain.sessions_dir, &plain.session)
-                    .await?;
+                forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
                 println!("skills cleared");
                 return Ok(false);
             }
@@ -501,10 +513,7 @@ async fn handle_interactive_command(
                 plain.session.active_skills.push(name.to_string());
             }
             forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
-            println!(
-                "active skills: {}",
-                plain.session.active_skills.join(", ")
-            );
+            println!("active skills: {}", plain.session.active_skills.join(", "));
             Ok(false)
         }
         "bypass" => {
@@ -548,11 +557,8 @@ async fn handle_interactive_command(
                 return Ok(false);
             };
             plain.session.record_user(record.prompt.clone());
-            let prompt_prefix = active_skill_prompt(
-                &plain.skills,
-                &plain.session.active_skills,
-                &record.prompt,
-            );
+            let prompt_prefix =
+                active_skill_prompt(&plain.skills, &plain.session.active_skills, &record.prompt);
             let retry = run_with_live_output(
                 config,
                 runs_dir,
@@ -585,10 +591,8 @@ async fn handle_interactive_command(
         }
         "new" => {
             forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
-            let mut next = forge_cli::Session::new(
-                plain.session.profile.clone(),
-                plain.session.cwd.clone(),
-            );
+            let mut next =
+                forge_cli::Session::new(plain.session.profile.clone(), plain.session.cwd.clone());
             next.bypass = plain.session.bypass;
             next.desktop = plain.session.desktop;
             next.timeout_secs = plain.session.timeout_secs;
@@ -606,8 +610,15 @@ async fn handle_interactive_command(
                 return Ok(false);
             }
             for session in sessions.into_iter().take(20) {
-                let active = if session.id == plain.session.id { "*" } else { " " };
-                let name = session.name.clone().unwrap_or_else(|| "(unnamed)".to_string());
+                let active = if session.id == plain.session.id {
+                    "*"
+                } else {
+                    " "
+                };
+                let name = session
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "(unnamed)".to_string());
                 println!(
                     "{active} {} profile={} turns={} updated={} {}",
                     session.short_id(),
@@ -621,11 +632,9 @@ async fn handle_interactive_command(
         }
         "resume" => {
             let next = match parts.next() {
-                Some(id) => forge_cli::load_session(&plain.sessions_dir, id)
-                    .await?,
+                Some(id) => forge_cli::load_session(&plain.sessions_dir, id).await?,
                 None => {
-                    let mut sessions =
-                        forge_cli::list_sessions(&plain.sessions_dir).await?;
+                    let mut sessions = forge_cli::list_sessions(&plain.sessions_dir).await?;
                     sessions.retain(|session| session.id != plain.session.id);
                     match sessions.into_iter().next() {
                         Some(session) => session,
@@ -649,9 +658,7 @@ async fn handle_interactive_command(
         }
         "fork" => {
             let source = match parts.next() {
-                Some(id) => {
-                    forge_cli::load_session(&plain.sessions_dir, id).await?
-                }
+                Some(id) => forge_cli::load_session(&plain.sessions_dir, id).await?,
                 None => plain.session.clone(),
             };
             let fork = source.fork();
@@ -684,7 +691,10 @@ async fn handle_interactive_command(
             println!("cwd: {}", plain.session.cwd.display());
             println!("mode: {mode}");
             println!("active skills: {skills}");
-            println!("last run: {}", plain.last_run_id.as_deref().unwrap_or("(none)"));
+            println!(
+                "last run: {}",
+                plain.last_run_id.as_deref().unwrap_or("(none)")
+            );
             Ok(false)
         }
         "model" => {
@@ -710,31 +720,19 @@ async fn handle_interactive_command(
                 Some("guarded") => {
                     plain.session.bypass = false;
                     plain.session.desktop = false;
-                    forge_cli::save_session(
-                        &plain.sessions_dir,
-                        &plain.session,
-                    )
-                    .await?;
+                    forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
                     println!("permissions: guarded");
                 }
                 Some("bypass") => {
                     plain.session.bypass = true;
                     plain.session.desktop = false;
-                    forge_cli::save_session(
-                        &plain.sessions_dir,
-                        &plain.session,
-                    )
-                    .await?;
+                    forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
                     println!("permissions: bypass");
                 }
                 Some("desktop") => {
                     plain.session.bypass = true;
                     plain.session.desktop = true;
-                    forge_cli::save_session(
-                        &plain.sessions_dir,
-                        &plain.session,
-                    )
-                    .await?;
+                    forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
                     println!("permissions: desktop");
                 }
                 Some(other) => {
@@ -752,8 +750,7 @@ async fn handle_interactive_command(
             if before > keep {
                 let dropped = before - keep;
                 plain.session.transcript.drain(..dropped);
-                forge_cli::save_session(&plain.sessions_dir, &plain.session)
-                    .await?;
+                forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
                 println!("compacted: dropped {dropped} turn(s)");
             } else {
                 println!("nothing to compact ({before} turns)");
@@ -768,11 +765,7 @@ async fn handle_interactive_command(
                 },
                 Some("clear") => {
                     plain.session.provider_session_id = None;
-                    forge_cli::save_session(
-                        &plain.sessions_dir,
-                        &plain.session,
-                    )
-                    .await?;
+                    forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
                     println!("provider session id cleared");
                 }
                 Some("set") => {
@@ -781,18 +774,28 @@ async fn handle_interactive_command(
                         return Ok(false);
                     };
                     plain.session.provider_session_id = Some(id.to_string());
-                    forge_cli::save_session(
-                        &plain.sessions_dir,
-                        &plain.session,
-                    )
-                    .await?;
+                    forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
                     println!("provider session id: {id}");
                 }
                 Some(other) => println!("Unknown /provider subcommand `{other}`"),
             }
             Ok(false)
         }
+        "clear" => {
+            // ANSI clear + cursor home. Works in any VT100-ish terminal.
+            print!("\x1b[2J\x1b[H");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            Ok(false)
+        }
+        cmd @ ("smoke" | "inspect" | "open-run" | "logs" | "export" | "jobs") => {
+            println!(
+                "/{cmd} is only available in the interactive TUI. Run `forge` without `--plain` to use it."
+            );
+            Ok(false)
+        }
         unknown => {
+            // Defensive: dispatch only sees `classify_input -> Command(_)`, so
+            // this arm should be unreachable. Keep it as a clear error.
             println!("unknown command: /{unknown}");
             Ok(false)
         }
@@ -809,16 +812,6 @@ fn parse_toggle(value: Option<&str>, current: bool) -> bool {
 
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
-}
-
-fn slash_command(input: &str) -> Option<&str> {
-    let command = input.strip_prefix('/')?;
-    let name = command.split_whitespace().next().unwrap_or_default();
-    is_known_command(name).then_some(command)
-}
-
-fn is_known_command(name: &str) -> bool {
-    commands::is_known(name)
 }
 
 fn active_skill_prompt(

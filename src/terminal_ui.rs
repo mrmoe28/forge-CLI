@@ -1,26 +1,11 @@
 use crate::InteractiveArgs;
 use crate::commands;
+use crate::commands::InputClass;
 use crate::commands::SlashCommand;
+use crate::commands::classify_input;
 use crate::composer::Composer;
 use anyhow::Context;
 use anyhow::Result;
-use forge_cli::HarnessConfig;
-use forge_cli::RunEvent;
-use forge_cli::RunRecord;
-use forge_cli::RunRequest;
-use forge_cli::RunStatus;
-use forge_cli::Skill;
-use forge_cli::create_skill;
-use forge_cli::discover_skills;
-use forge_cli::find_run;
-use forge_cli::Session;
-use forge_cli::SessionTurn;
-use forge_cli::list_runs;
-use forge_cli::list_sessions;
-use forge_cli::load_session;
-use forge_cli::read_transcript;
-use forge_cli::run_agent_streaming;
-use forge_cli::save_session;
 use crossterm::event;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
@@ -28,6 +13,23 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use crossterm::execute;
 use crossterm::terminal;
+use forge_cli::HarnessConfig;
+use forge_cli::RunEvent;
+use forge_cli::RunRecord;
+use forge_cli::RunRequest;
+use forge_cli::RunStatus;
+use forge_cli::Session;
+use forge_cli::SessionTurn;
+use forge_cli::Skill;
+use forge_cli::create_skill;
+use forge_cli::discover_skills;
+use forge_cli::find_run;
+use forge_cli::list_runs;
+use forge_cli::list_sessions;
+use forge_cli::load_session;
+use forge_cli::read_transcript;
+use forge_cli::run_agent_streaming;
+use forge_cli::save_session;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Constraint;
@@ -201,7 +203,11 @@ impl TuiState {
             "Session {} ({} turn{})",
             self.session.short_id(),
             self.session.turn_count(),
-            if self.session.turn_count() == 1 { "" } else { "s" }
+            if self.session.turn_count() == 1 {
+                ""
+            } else {
+                "s"
+            }
         ))];
         for turn in &self.session.transcript {
             match turn {
@@ -313,8 +319,7 @@ enum TranscriptKind {
 fn render(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     let suggestions = suggestions(state);
     let suggestions_height = suggestions_height(&suggestions);
-    let selected_command =
-        selected_command_for(&suggestions, state.selected_suggestion);
+    let selected_command = selected_command_for(&suggestions, state.selected_suggestion);
     let details_height = if suggestions_height > 0 && selected_command.is_some() {
         2
     } else {
@@ -451,10 +456,7 @@ fn render_approval_card(frame: &mut ratatui::Frame<'_>, approval: &PendingApprov
         Line::from(Span::styled("cwd", Style::default().fg(Color::DarkGray))),
         Line::from(Span::raw(approval.cwd.display().to_string())),
         Line::from(""),
-        Line::from(Span::styled(
-            "prompt",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled("prompt", Style::default().fg(Color::DarkGray))),
     ];
     for prompt_line in approval.prompt.lines().take(10) {
         lines.push(Line::from(Span::raw(prompt_line)));
@@ -518,8 +520,14 @@ fn session_to_markdown(session: &Session) -> String {
         "**bypass:** {}, **desktop:** {}\n",
         session.bypass, session.desktop
     ));
-    out.push_str(&format!("**created:** {}\n", session.created_at.to_rfc3339()));
-    out.push_str(&format!("**updated:** {}\n\n", session.updated_at.to_rfc3339()));
+    out.push_str(&format!(
+        "**created:** {}\n",
+        session.created_at.to_rfc3339()
+    ));
+    out.push_str(&format!(
+        "**updated:** {}\n\n",
+        session.updated_at.to_rfc3339()
+    ));
     for turn in &session.transcript {
         match turn {
             SessionTurn::User { text, at } => {
@@ -528,7 +536,11 @@ fn session_to_markdown(session: &Session) -> String {
                 out.push_str("\n\n");
             }
             SessionTurn::Assistant { text, run_id, at } => {
-                out.push_str(&format!("## Assistant · {} · run {}\n\n", at.to_rfc3339(), run_id));
+                out.push_str(&format!(
+                    "## Assistant · {} · run {}\n\n",
+                    at.to_rfc3339(),
+                    run_id
+                ));
                 out.push_str(text);
                 out.push_str("\n\n");
             }
@@ -561,11 +573,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn render_command_details(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    cmd: &'static SlashCommand,
-) {
+fn render_command_details(frame: &mut ratatui::Frame<'_>, area: Rect, cmd: &'static SlashCommand) {
     let lines = vec![
         Line::from(vec![
             Span::styled(
@@ -580,10 +588,7 @@ fn render_command_details(
                 Style::default().fg(Color::Magenta),
             ),
         ]),
-        Line::from(Span::styled(
-            cmd.help,
-            Style::default().fg(Color::Gray),
-        )),
+        Line::from(Span::styled(cmd.help, Style::default().fg(Color::Gray))),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
@@ -715,7 +720,19 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('c') if ctrl => true,
         KeyCode::Char('d') if ctrl && state.composer.is_empty() => true,
-        KeyCode::Esc => true,
+        KeyCode::Esc => {
+            // Esc cancels an in-flight run (keeping the TUI open). When no run
+            // is active, Esc exits — matching the previous behaviour.
+            if cancel_active_run(
+                &mut state.active_run,
+                &mut state.transcript,
+                &mut state.status,
+            ) {
+                state.scroll = u16::MAX;
+                return false;
+            }
+            true
+        }
 
         // Submission and newline insertion. Alt+Enter / Shift+Enter inserts a
         // literal newline; Enter submits.
@@ -743,28 +760,52 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
                 state.composer.clear();
                 return false;
             }
-            let slash = slash_command(&trimmed);
-            if slash.is_none() && state.active_run.is_some() {
-                state.status = "Run in progress; wait or press Esc to exit".to_string();
-                return false;
+            match classify_input(&trimmed) {
+                InputClass::UnknownSlash(token) => {
+                    // Don't submit; show a "did-you-mean" hint and keep the
+                    // composer text so the user can correct it.
+                    let token = token.to_string();
+                    let hint = commands::fuzzy_search(&token)
+                        .first()
+                        .map(|cmd| cmd.name)
+                        .unwrap_or("help");
+                    state.status = format!(
+                        "Unknown command /{token}. Try /{hint} (or /help for the full list)"
+                    );
+                    false
+                }
+                InputClass::Command(_) => {
+                    let Some(submitted) = state.composer.submit() else {
+                        return false;
+                    };
+                    let submitted_trim = submitted.trim().to_string();
+                    // Re-classify the submitted form to extract the body
+                    // (handles trailing whitespace differences cleanly).
+                    if let InputClass::Command(rest) = classify_input(&submitted_trim) {
+                        state.pending_action = Some(Action::Command(rest.to_string()));
+                    } else {
+                        state.pending_action = Some(Action::Submit(submitted_trim));
+                    }
+                    false
+                }
+                InputClass::Path | InputClass::Prompt => {
+                    if state.active_run.is_some() {
+                        state.status = "Run in progress; wait or press Esc to exit".to_string();
+                        return false;
+                    }
+                    // Guarded mode: show an approval card for prompt
+                    // submissions instead of running the agent immediately.
+                    if !state.session.bypass && !state.session.desktop {
+                        state.pending_approval = build_pending_approval(state, trimmed);
+                        return false;
+                    }
+                    let Some(submitted) = state.composer.submit() else {
+                        return false;
+                    };
+                    state.pending_action = Some(Action::Submit(submitted.trim().to_string()));
+                    false
+                }
             }
-            // Guarded mode: show an approval card for non-slash submissions
-            // instead of running the agent immediately. The composer keeps
-            // its text until the user explicitly approves or denies.
-            if slash.is_none() && !state.session.bypass && !state.session.desktop {
-                state.pending_approval = build_pending_approval(state, trimmed);
-                return false;
-            }
-            // Use the composer's submit so the prompt is preserved in history.
-            let Some(submitted) = state.composer.submit() else {
-                return false;
-            };
-            let submitted_trim = submitted.trim().to_string();
-            state.pending_action = Some(match slash_command(&submitted_trim) {
-                Some(command) => Action::Command(command.to_string()),
-                None => Action::Submit(submitted_trim),
-            });
-            false
         }
 
         // Word-level edits and movement.
@@ -923,16 +964,15 @@ fn suggestions(state: &TuiState) -> Vec<Suggestion> {
     if query.contains('/') {
         return Vec::new();
     }
+    // Treat path-like input (e.g. existing `/tmp`) as prompt text so Enter
+    // never auto-applies a fuzzy command match.
+    if matches!(classify_input(input.trim_end()), InputClass::Path) {
+        return Vec::new();
+    }
     if let Some(skill_query) = query.strip_prefix("skill ") {
         return skill_suggestions(state, skill_query.trim());
     }
     command_suggestions(query.trim())
-}
-
-fn slash_command(input: &str) -> Option<&str> {
-    let command = input.strip_prefix('/')?;
-    let name = command.split_whitespace().next().unwrap_or_default();
-    commands::is_known(name).then_some(command)
 }
 
 fn command_suggestions(query: &str) -> Vec<Suggestion> {
@@ -946,7 +986,10 @@ fn command_suggestions(query: &str) -> Vec<Suggestion> {
         .collect()
 }
 
-fn selected_command_for(suggestions: &[Suggestion], selected: usize) -> Option<&'static SlashCommand> {
+fn selected_command_for(
+    suggestions: &[Suggestion],
+    selected: usize,
+) -> Option<&'static SlashCommand> {
     let suggestion = suggestions.get(selected.min(suggestions.len().saturating_sub(1)))?;
     if let SuggestionAction::Command(name) = &suggestion.action {
         commands::lookup(name)
@@ -1044,7 +1087,10 @@ fn handle_approval_key(state: &mut TuiState, key: KeyEvent) -> bool {
             approve_pending(state, true);
             false
         }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('e') | KeyCode::Char('E')
+        KeyCode::Char('n')
+        | KeyCode::Char('N')
+        | KeyCode::Char('e')
+        | KeyCode::Char('E')
         | KeyCode::Esc => {
             state.pending_approval = None;
             state.status = "Run denied; edit and resubmit".to_string();
@@ -1082,6 +1128,31 @@ fn approve_pending(state: &mut TuiState, persist_bypass: bool) {
     // lands in history.
     let _ = state.composer.submit();
     state.pending_action = Some(Action::Submit(approval.prompt));
+}
+
+/// Abort the in-flight run, if any, and surface a `Run cancelled` line. Returns
+/// `true` when a run was actually cancelled; the Esc handler uses that to
+/// decide whether to suppress the default "exit TUI" behavior.
+fn cancel_active_run(
+    active_run: &mut Option<ActiveRun>,
+    transcript: &mut Vec<TranscriptEntry>,
+    status: &mut String,
+) -> bool {
+    let Some(active) = active_run.take() else {
+        return false;
+    };
+    // Abort drops the future, which drops the kill_on_drop child handle and
+    // reaps the agent process. We don't await the JoinHandle here — the TUI
+    // loop returns immediately so the user sees the cancel land.
+    active.handle.abort();
+    let suffix = if active.assistant_open || active.error_open {
+        " (partial output preserved above)"
+    } else {
+        ""
+    };
+    transcript.push(TranscriptEntry::system(format!("Run cancelled{suffix}")));
+    *status = "Run cancelled".to_string();
+    true
 }
 
 fn start_run(state: &mut TuiState, prompt: String) {
@@ -1135,9 +1206,7 @@ async fn pump_active_run(state: &mut TuiState) {
         apply_run_event(state, event);
     }
 
-    if finished
-        && let Some(active) = state.active_run.take()
-    {
+    if finished && let Some(active) = state.active_run.take() {
         match active.handle.await {
             Ok(Ok(record)) => {
                 state.last_run_id = Some(record.id.clone());
@@ -1183,7 +1252,10 @@ async fn pump_active_run(state: &mut TuiState) {
 fn apply_run_event(state: &mut TuiState, event: RunEvent) {
     match event {
         RunEvent::Started(started) => {
-            state.status = format!("Running ({})", started.id.chars().take(8).collect::<String>());
+            state.status = format!(
+                "Running ({})",
+                started.id.chars().take(8).collect::<String>()
+            );
         }
         RunEvent::Stdout(line) => {
             if line.is_empty() {
@@ -1359,10 +1431,7 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             {
                 state.session.active_skills.push(name.to_string());
             }
-            state.status = format!(
-                "Active skills: {}",
-                state.session.active_skills.join(", ")
-            );
+            state.status = format!("Active skills: {}", state.session.active_skills.join(", "));
             let _ = save_session(&state.sessions_dir, &state.session).await;
             Ok(false)
         }
@@ -1657,9 +1726,12 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             };
             let body = serde_json::to_string_pretty(&record)
                 .unwrap_or_else(|err| format!("(failed to serialize: {err})"));
-            let entries = std::iter::once(TranscriptEntry::system(format!("run dir: {}", path.display())))
-                .chain(body.lines().map(TranscriptEntry::system))
-                .collect::<Vec<_>>();
+            let entries = std::iter::once(TranscriptEntry::system(format!(
+                "run dir: {}",
+                path.display()
+            )))
+            .chain(body.lines().map(TranscriptEntry::system))
+            .collect::<Vec<_>>();
             state.push_entries(entries);
             Ok(false)
         }
@@ -1847,10 +1919,7 @@ fn active_skill_prompt_for(state: &TuiState, user_prompt: &str) -> Option<String
     Some(prompt)
 }
 
-fn render_record(
-    record: &forge_cli::RunRecord,
-    transcript: String,
-) -> Vec<TranscriptEntry> {
+fn render_record(record: &forge_cli::RunRecord, transcript: String) -> Vec<TranscriptEntry> {
     let mut lines = vec![TranscriptEntry::system(format!(
         "{} {:?} profile={} duration={}ms",
         record.id, record.status, record.profile, record.duration_ms
@@ -1915,5 +1984,150 @@ impl Drop for TerminalGuard {
         let _ = execute!(io::stdout(), event::DisableBracketedPaste);
         let _ = terminal::disable_raw_mode();
         let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn cancel_returns_false_when_no_active_run() {
+        let mut active_run: Option<ActiveRun> = None;
+        let mut transcript: Vec<TranscriptEntry> = Vec::new();
+        let mut status = String::new();
+        assert!(!cancel_active_run(
+            &mut active_run,
+            &mut transcript,
+            &mut status
+        ));
+        assert!(transcript.is_empty());
+        assert!(status.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_handle_and_clears_state() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        // A future that would never complete on its own; we'll abort it.
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            unreachable!("the task is aborted before it can finish")
+        });
+        let mut active_run = Some(ActiveRun {
+            handle,
+            rx,
+            assistant_open: false,
+            error_open: false,
+            assistant_buffer: String::new(),
+        });
+        let mut transcript: Vec<TranscriptEntry> = Vec::new();
+        let mut status = "Running…".to_string();
+
+        let cancelled = cancel_active_run(&mut active_run, &mut transcript, &mut status);
+
+        assert!(cancelled);
+        assert!(active_run.is_none(), "active_run slot should be cleared");
+        assert_eq!(transcript.len(), 1);
+        assert!(
+            transcript[0].text.starts_with("Run cancelled"),
+            "expected a `Run cancelled` system line, got: {:?}",
+            transcript[0].text
+        );
+        assert_eq!(status, "Run cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_notes_partial_output_when_streams_were_open() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            unreachable!()
+        });
+        let mut active_run = Some(ActiveRun {
+            handle,
+            rx,
+            assistant_open: true,
+            error_open: false,
+            assistant_buffer: "partial response so far".to_string(),
+        });
+        let mut transcript: Vec<TranscriptEntry> = Vec::new();
+        let mut status = String::new();
+
+        cancel_active_run(&mut active_run, &mut transcript, &mut status);
+
+        assert!(
+            transcript[0].text.contains("partial output preserved"),
+            "expected partial-output hint, got: {:?}",
+            transcript[0].text
+        );
+    }
+
+    #[test]
+    fn classifies_known_command() {
+        assert!(matches!(classify_input("/help"), InputClass::Command(_)));
+        assert!(matches!(
+            classify_input("/skill foo"),
+            InputClass::Command(_)
+        ));
+        // Alias resolves through commands::is_known.
+        assert!(matches!(classify_input("/q"), InputClass::Command(_)));
+        // Leading/trailing whitespace is tolerated.
+        assert!(matches!(
+            classify_input("  /status   "),
+            InputClass::Command(_)
+        ));
+    }
+
+    #[test]
+    fn classifies_nested_path_as_path_even_if_missing() {
+        assert_eq!(
+            classify_input("/no/such/path/here"),
+            InputClass::Path,
+            "multi-segment slash input should be a Path"
+        );
+        assert_eq!(classify_input("/home/mrmoe28/Project"), InputClass::Path);
+    }
+
+    #[test]
+    fn classifies_existing_absolute_path_as_path() {
+        // Skip if `/tmp` is missing (unlikely on dev hosts).
+        if std::path::Path::new("/tmp").exists() {
+            assert_eq!(classify_input("/tmp"), InputClass::Path);
+        }
+    }
+
+    #[test]
+    fn classifies_unknown_single_token_slash() {
+        match classify_input("/foobar") {
+            InputClass::UnknownSlash(name) => assert_eq!(name, "foobar"),
+            other => panic!("expected UnknownSlash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classifies_plain_prompt() {
+        assert_eq!(classify_input("hello world"), InputClass::Prompt);
+        assert_eq!(classify_input(""), InputClass::Prompt);
+        assert_eq!(classify_input("./relative/path"), InputClass::Prompt);
+    }
+
+    #[test]
+    fn classifier_extracts_command_body() {
+        match classify_input("/skill foo") {
+            InputClass::Command(body) => assert_eq!(body, "skill foo"),
+            other => panic!("expected Command, got {other:?}"),
+        }
+        match classify_input("/help") {
+            InputClass::Command(body) => assert_eq!(body, "help"),
+            other => panic!("expected Command, got {other:?}"),
+        }
+        // Path-looking inputs are not commands.
+        assert!(!matches!(
+            classify_input("/home/mrmoe28/Project"),
+            InputClass::Command(_)
+        ));
+        // Unknown single-token slash is not a command either.
+        assert!(!matches!(classify_input("/foobar"), InputClass::Command(_)));
     }
 }

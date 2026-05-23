@@ -389,8 +389,7 @@ async fn resolve_session_path(sessions_dir: &Path, id_or_prefix: &str) -> Result
             return Err(anyhow!("no sessions found in {}", sessions_dir.display()));
         }
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to read {}", sessions_dir.display()));
+            return Err(err).with_context(|| format!("failed to read {}", sessions_dir.display()));
         }
     };
     while let Some(entry) = entries.next_entry().await? {
@@ -618,6 +617,10 @@ pub async fn run_agent_streaming(
     command.envs(&profile.env);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    // Ensure the child is reaped if the spawning task is aborted (e.g. when
+    // the user cancels an in-flight run from the TUI). Without this, an Esc
+    // press would orphan the agent process.
+    command.kill_on_drop(true);
 
     let mut child = command
         .spawn()
@@ -682,10 +685,9 @@ pub async fn run_agent_streaming(
         WaitOutcome::TimedOut => (RunStatus::TimedOut, None),
     };
     let captured_session_id = match profile.session_id_capture_prefix.as_deref() {
-        Some(prefix) if !prefix.is_empty() => extract_session_id(&stdout_log, prefix)
-            .await
-            .ok()
-            .flatten(),
+        Some(prefix) if !prefix.is_empty() => {
+            extract_session_id(&stdout_log, prefix).await.ok().flatten()
+        }
         _ => None,
     };
     let record = RunRecord {
@@ -942,7 +944,10 @@ fn first_markdown_heading(body: &str) -> Option<String> {
 fn parse_frontmatter(text: &str, description: &mut Option<String>, triggers: &mut Vec<String>) {
     let mut in_triggers = false;
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("- ").and_then(|s| in_triggers.then_some(s)) {
+        if let Some(rest) = line
+            .strip_prefix("- ")
+            .and_then(|s| in_triggers.then_some(s))
+        {
             let value = strip_quotes(rest.trim());
             if !value.is_empty() {
                 triggers.push(value.to_string());
@@ -974,10 +979,7 @@ fn parse_frontmatter(text: &str, description: &mut Option<String>, triggers: &mu
                     in_triggers = true;
                 } else {
                     // Inline form: `triggers: [a, b]` or `triggers: a`.
-                    if let Some(inner) = value
-                        .strip_prefix('[')
-                        .and_then(|v| v.strip_suffix(']'))
-                    {
+                    if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
                         for part in inner.split(',') {
                             let part = strip_quotes(part.trim());
                             if !part.is_empty() {
@@ -1250,7 +1252,10 @@ mod tests {
 
         // The disk log should still contain the same bytes — the streaming
         // tap must not skip writing.
-        assert_eq!(read_optional_string(&record.stdout_log).await?, "one\ntwo\nthree\n");
+        assert_eq!(
+            read_optional_string(&record.stdout_log).await?,
+            "one\ntwo\nthree\n"
+        );
         assert_eq!(read_optional_string(&record.stderr_log).await?, "oops\n");
         Ok(())
     }
@@ -1329,7 +1334,10 @@ mod tests {
     fn parses_skill_with_frontmatter() {
         let raw = "---\nname: weather\ndescription: Answer weather questions\ntriggers:\n  - \"weather\"\n  - forecast\n---\n\n# Weather\n\nUse the weather skill.\n";
         let parsed = parse_skill_file(raw);
-        assert_eq!(parsed.description.as_deref(), Some("Answer weather questions"));
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("Answer weather questions")
+        );
         assert_eq!(parsed.triggers, vec!["weather", "forecast"]);
         assert_eq!(parsed.title.as_deref(), Some("Weather"));
         assert!(parsed.body.starts_with("# Weather"));

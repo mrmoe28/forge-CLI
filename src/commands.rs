@@ -231,6 +231,64 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
 /// Aliases handled by `lookup` so that `/q`, `/quit`, `/h` all resolve.
 const ALIASES: &[(&str, &str)] = &[("h", "help"), ("quit", "exit"), ("q", "exit")];
 
+/// Classification of free-form user input at submit time.
+///
+/// Both the TUI Enter handler and the plain REPL route on this so behaviour
+/// stays consistent: known slashes dispatch, pasted paths fall through to the
+/// agent, and unknown slashes can be flagged with a "did-you-mean" hint
+/// instead of being sent verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InputClass<'a> {
+    /// First token is a known slash command. The captured slice is the
+    /// command body (everything after the leading `/`).
+    Command(&'a str),
+    /// Input looks like a filesystem path; pass to the agent as a prompt.
+    Path,
+    /// Input starts with `/` but is neither a known command nor a path. The
+    /// captured slice is the first whitespace-delimited token (without the
+    /// leading slash) so callers can build a hint.
+    UnknownSlash(&'a str),
+    /// Plain prompt text (no leading `/`).
+    Prompt,
+}
+
+pub(crate) fn classify_input(input: &str) -> InputClass<'_> {
+    let trimmed = input.trim();
+    let Some(rest) = trimmed.strip_prefix('/') else {
+        return InputClass::Prompt;
+    };
+    let first_token = rest.split_whitespace().next().unwrap_or_default();
+    if is_known(first_token) {
+        return InputClass::Command(rest);
+    }
+    if looks_like_path(trimmed) {
+        return InputClass::Path;
+    }
+    InputClass::UnknownSlash(first_token)
+}
+
+/// True when `trimmed` looks like a filesystem path the user pasted or typed.
+/// Either the path actually exists on disk, or its first whitespace-delimited
+/// segment contains an additional `/` (e.g. `/home/me/repo`). Single-segment
+/// non-existent strings like `/foobar` are NOT classified as paths so they
+/// can be flagged as unknown commands.
+fn looks_like_path(trimmed: &str) -> bool {
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+    let path = std::path::Path::new(trimmed);
+    if path.is_absolute() && path.exists() {
+        return true;
+    }
+    if let Some(rest) = trimmed.strip_prefix('/')
+        && let Some(first) = rest.split_whitespace().next()
+        && first.contains('/')
+    {
+        return true;
+    }
+    false
+}
+
 pub(crate) fn lookup(name: &str) -> Option<&'static SlashCommand> {
     let canonical = ALIASES
         .iter()
@@ -339,5 +397,79 @@ mod tests {
     fn fuzzy_search_returns_empty_on_no_match() {
         let results = fuzzy_search("zzzz");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn every_command_resolves_via_lookup() {
+        // Guards against commands that drift out of sync with `is_known`/dispatch:
+        // every entry in COMMANDS must round-trip through `lookup`.
+        for cmd in COMMANDS {
+            assert_eq!(
+                lookup(cmd.name).map(|c| c.name),
+                Some(cmd.name),
+                "command `{}` does not round-trip through lookup",
+                cmd.name
+            );
+        }
+    }
+
+    #[test]
+    fn classify_known_command() {
+        assert!(matches!(classify_input("/help"), InputClass::Command(_)));
+        assert!(matches!(
+            classify_input("/skill foo"),
+            InputClass::Command(_)
+        ));
+        // Aliases.
+        assert!(matches!(classify_input("/q"), InputClass::Command(_)));
+        assert!(matches!(classify_input("/h"), InputClass::Command(_)));
+    }
+
+    #[test]
+    fn classify_nested_path_is_path_even_if_missing() {
+        // Heuristic: first segment contains another '/'.
+        assert_eq!(
+            classify_input("/no/such/dir/here"),
+            InputClass::Path,
+            "multi-segment slash input should be classified as Path"
+        );
+        assert_eq!(classify_input("/home/mrmoe28/Project"), InputClass::Path);
+    }
+
+    #[test]
+    fn classify_existing_absolute_path_is_path() {
+        if std::path::Path::new("/tmp").exists() {
+            assert_eq!(classify_input("/tmp"), InputClass::Path);
+        }
+    }
+
+    #[test]
+    fn classify_unknown_single_token_slash_is_unknown() {
+        match classify_input("/foobar") {
+            InputClass::UnknownSlash(name) => assert_eq!(name, "foobar"),
+            other => panic!("expected UnknownSlash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_plain_prompt() {
+        assert_eq!(classify_input("hello world"), InputClass::Prompt);
+        assert_eq!(classify_input(""), InputClass::Prompt);
+        // Relative paths don't start with '/', so they're Prompt.
+        assert_eq!(classify_input("./relative/path"), InputClass::Prompt);
+    }
+
+    #[test]
+    fn every_alias_resolves_to_a_known_command() {
+        for (alias, target) in ALIASES {
+            assert!(
+                COMMANDS.iter().any(|cmd| cmd.name == *target),
+                "alias `{alias}` -> `{target}` has no matching command entry"
+            );
+            assert!(
+                is_known(alias),
+                "alias `{alias}` should be recognized by is_known"
+            );
+        }
     }
 }
