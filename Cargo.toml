@@ -1,0 +1,43 @@
+[package]
+name = "forge-cli"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Interactive harness for external coding agents (opencode, claude, etc.)"
+repository = "https://github.com/mrmoe28/forge-CLI"
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[lib]
+doctest = false
+name = "forge_cli"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
+csv = "1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+toml = "0.9"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
