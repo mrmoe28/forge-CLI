@@ -34,11 +34,20 @@ Wraps the underlying agent subprocess with:
 
 ## Install
 
+Install the latest `forge` binary from this repository:
+
 ```sh
-cargo install --path .
+cargo install --locked --git https://github.com/mrmoe28/forge-CLI.git forge-cli
 ```
 
 The binary is named `forge`.
+
+If you already cloned the repository and want to install from your local
+checkout instead:
+
+```sh
+cargo install --path .
+```
 
 ## Quick start
 
