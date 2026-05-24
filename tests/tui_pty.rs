@@ -62,6 +62,22 @@ fn enter_on_complete_known_command_dispatches_verbatim() -> anyhow::Result<()> {
 }
 
 #[test]
+fn run_output_uses_structured_activity_sections() -> anyhow::Result<()> {
+    let mut harness = PtyHarness::launch_default()?;
+    harness.wait_for_contains("forge")?;
+
+    harness.send_line("/bypass on")?;
+    harness.wait_for_contains("Bypass mode on")?;
+
+    harness.send_line("show structured output")?;
+    harness.wait_for_contains("thinking: started agent run")?;
+    harness.wait_for_contains("output: agent response")?;
+    harness.wait_for_contains("FORGE_PTY_FAST_MARKER")?;
+    harness.wait_for_contains("done: run succeeded")?;
+    Ok(())
+}
+
+#[test]
 fn transcript_overflows_and_can_be_scrolled() -> anyhow::Result<()> {
     let mut harness = PtyHarness::launch(HarnessConfig::default_fast().size(18, 100))?;
     harness.wait_for_contains("forge")?;

@@ -14,6 +14,8 @@ Wraps the underlying agent subprocess with:
   & word/line edits, plus a small border chip (` path ` / ` unknown `)
   showing how Enter will route the current text
 - a fuzzy slash-command palette with categorized commands and detail panel
+- structured run transcript markers (`thinking:`, `output:`, `errors:`,
+  `done:` / `failed:`) so streamed agent output is easier to scan
 - `Esc` (or `/cancel`) aborts an in-flight run cleanly: the spawned task
   is dropped, the child agent is reaped via `kill_on_drop`, and a
   `Run cancelled` line lands in the transcript (with a partial-output
@@ -373,6 +375,11 @@ state has exactly one home and never has to compete for the same row.
   info in the top header.
 - **Run timer**: while a run is in flight, the status bar's run-state
   segment shows the live elapsed time, scaling from `12s` to `2m05s`.
+- **Run transcript sections**: each submitted prompt is followed by a
+  `thinking:` marker while forge is waiting for the agent subprocess,
+  `output:` before the first stdout line, `errors:` before the first stderr
+  line, and a final `done:` / `failed:` summary with duration and run id.
+  These are forge-observed activity labels, not hidden model reasoning.
 
 ### Cancellation
 

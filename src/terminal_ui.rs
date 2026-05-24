@@ -1495,6 +1495,7 @@ fn cancel_active_run(
 
 fn start_run(state: &mut TuiState, prompt: String) {
     state.push_entries([TranscriptEntry::user(prompt.clone())]);
+    state.push_system("thinking: started agent run; waiting for output");
     state.status = "Running…".to_string();
     state.session.record_user(prompt.clone());
 
@@ -1560,11 +1561,14 @@ async fn pump_active_run(state: &mut TuiState) {
                 // "(no output)" or "exit code: None" line afterwards.
                 let suppress_followups =
                     active.cancel_requested || record.status == RunStatus::Cancelled;
+                if !suppress_followups {
+                    state.push_system(format_run_completion(&record));
+                }
                 if !active.assistant_open && !active.error_open && !suppress_followups {
-                    state.push_entries([TranscriptEntry::system(format!(
-                        "(no output) exit={:?}",
+                    state.push_system(format!(
+                        "output: no streamed output; exit={:?}",
                         record.exit_code
-                    ))]);
+                    ));
                 }
                 if record.status != RunStatus::Succeeded && !suppress_followups {
                     for line in format_failure_guidance(&record) {
@@ -1623,6 +1627,9 @@ fn apply_run_event(state: &mut TuiState, event: RunEvent) {
             } else {
                 false
             };
+            if !was_open {
+                state.push_system("output: agent response");
+            }
             let entry = if was_open {
                 TranscriptEntry::assistant_cont(line)
             } else {
@@ -1641,6 +1648,9 @@ fn apply_run_event(state: &mut TuiState, event: RunEvent) {
             } else {
                 false
             };
+            if !was_open {
+                state.push_system("errors: agent stderr");
+            }
             let entry = if was_open {
                 TranscriptEntry::error_cont(line)
             } else {
@@ -1653,6 +1663,32 @@ fn apply_run_event(state: &mut TuiState, event: RunEvent) {
             // truth for completion. The event is forwarded for stream-only
             // consumers; the TUI ignores it.
         }
+    }
+}
+
+fn format_run_completion(record: &RunRecord) -> String {
+    match record.status {
+        RunStatus::Succeeded => format!(
+            "done: run succeeded in {}ms (id {})",
+            record.duration_ms,
+            record.id.chars().take(8).collect::<String>()
+        ),
+        RunStatus::Failed => format!(
+            "failed: run exited {:?} in {}ms (id {})",
+            record.exit_code,
+            record.duration_ms,
+            record.id.chars().take(8).collect::<String>()
+        ),
+        RunStatus::TimedOut => format!(
+            "failed: run timed out in {}ms (id {})",
+            record.duration_ms,
+            record.id.chars().take(8).collect::<String>()
+        ),
+        RunStatus::Cancelled => format!(
+            "cancelled: run stopped in {}ms (id {})",
+            record.duration_ms,
+            record.id.chars().take(8).collect::<String>()
+        ),
     }
 }
 
