@@ -379,6 +379,7 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         .iter()
         .map(render_entry)
         .collect::<Vec<_>>();
+    frame.render_widget(Clear, chunks[1]);
     let transcript_area = chunks[1].inner(Margin {
         vertical: 1,
         horizontal: 1,
@@ -937,25 +938,34 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             false
         }
         KeyCode::Enter => {
-            let suggestions = suggestions(state);
-            if !suggestions.is_empty()
-                && let Some(action) = suggestions
-                    .get(
-                        state
-                            .selected_suggestion
-                            .min(suggestions.len().saturating_sub(1)),
-                    )
-                    .map(|suggestion| suggestion.action.clone())
-            {
-                apply_suggestion(state, action);
-                return false;
-            }
             let trimmed = state.composer.text().trim().to_string();
             if trimmed.is_empty() {
                 state.composer.clear();
                 return false;
             }
-            match classify_input(&trimmed) {
+            let classified = classify_input(&trimmed);
+            // The suggestion palette only steers Enter while the user is
+            // mid-typing — i.e. the input does NOT yet classify as a known
+            // command. If the user has typed a complete slash command (with
+            // or without arguments), dispatch it verbatim and never let a
+            // fuzzy match (e.g. /skill clear, /skills) override the
+            // explicit intent.
+            if !matches!(classified, InputClass::Command(_)) {
+                let suggestions = suggestions(state);
+                if !suggestions.is_empty()
+                    && let Some(action) = suggestions
+                        .get(
+                            state
+                                .selected_suggestion
+                                .min(suggestions.len().saturating_sub(1)),
+                        )
+                        .map(|suggestion| suggestion.action.clone())
+                {
+                    apply_suggestion(state, action);
+                    return false;
+                }
+            }
+            match classified {
                 InputClass::UnknownSlash(token) => {
                     // Don't submit; show a "did-you-mean" hint and keep the
                     // composer text so the user can correct it.
@@ -2402,6 +2412,10 @@ mod tests {
             classify_input("/skill foo"),
             InputClass::Command(_)
         ));
+        assert!(matches!(
+            classify_input("/permissions bypass"),
+            InputClass::Command(_)
+        ));
         // Alias resolves through commands::is_known.
         assert!(matches!(classify_input("/q"), InputClass::Command(_)));
         // Leading/trailing whitespace is tolerated.
@@ -2448,6 +2462,10 @@ mod tests {
     fn classifier_extracts_command_body() {
         match classify_input("/skill foo") {
             InputClass::Command(body) => assert_eq!(body, "skill foo"),
+            other => panic!("expected Command, got {other:?}"),
+        }
+        match classify_input("/permissions bypass") {
+            InputClass::Command(body) => assert_eq!(body, "permissions bypass"),
             other => panic!("expected Command, got {other:?}"),
         }
         match classify_input("/help") {

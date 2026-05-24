@@ -427,6 +427,10 @@ mod tests {
             classify_input("/skill foo"),
             InputClass::Command(_)
         ));
+        assert!(matches!(
+            classify_input("/permissions bypass"),
+            InputClass::Command("permissions bypass")
+        ));
         // Aliases.
         assert!(matches!(classify_input("/q"), InputClass::Command(_)));
         assert!(matches!(classify_input("/h"), InputClass::Command(_)));
@@ -464,6 +468,110 @@ mod tests {
         assert_eq!(classify_input(""), InputClass::Prompt);
         // Relative paths don't start with '/', so they're Prompt.
         assert_eq!(classify_input("./relative/path"), InputClass::Prompt);
+    }
+
+    #[test]
+    fn every_registered_command_classifies_as_command() {
+        // Guards the contract that the Enter handler relies on: typing
+        // `/<name>` for any registered command must classify as Command, so
+        // the suggestion palette never hijacks dispatch.
+        for cmd in COMMANDS {
+            let input = format!("/{}", cmd.name);
+            let classified = classify_input(&input);
+            match classified {
+                InputClass::Command(body) => {
+                    assert_eq!(
+                        body, cmd.name,
+                        "Command body for `{}` should be its name verbatim",
+                        cmd.name
+                    );
+                }
+                other => panic!(
+                    "command `/{}` should classify as Command, got {:?}",
+                    cmd.name, other
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn every_alias_classifies_as_command() {
+        for (alias, _) in ALIASES {
+            let input = format!("/{alias}");
+            assert!(
+                matches!(classify_input(&input), InputClass::Command(_)),
+                "alias `/{alias}` should classify as Command"
+            );
+        }
+    }
+
+    #[test]
+    fn commands_with_arguments_classify_with_full_body() {
+        // Each case mirrors how a user actually types these commands. The
+        // Enter handler dispatches `body` verbatim, so the body must include
+        // the arguments — not just the command name.
+        for (input, expected_body) in [
+            ("/permissions bypass", "permissions bypass"),
+            ("/permissions guarded", "permissions guarded"),
+            ("/profile default", "profile default"),
+            ("/skill clear", "skill clear"),
+            ("/skill create demo", "skill create demo"),
+            ("/skill my-skill", "skill my-skill"),
+            ("/provider set abc123", "provider set abc123"),
+            ("/provider clear", "provider clear"),
+            ("/bypass on", "bypass on"),
+            ("/desktop off", "desktop off"),
+            ("/compact 50", "compact 50"),
+            ("/retry 4f3a8b", "retry 4f3a8b"),
+            ("/open-run abcdef", "open-run abcdef"),
+            ("/export out.md", "export out.md"),
+            ("/jobs jobs.json 4", "jobs jobs.json 4"),
+            ("/smoke Reply exactly: ok", "smoke Reply exactly: ok"),
+            // Leading/trailing whitespace is stripped before classification.
+            ("   /profile default   ", "profile default"),
+        ] {
+            match classify_input(input) {
+                InputClass::Command(body) => assert_eq!(
+                    body, expected_body,
+                    "input `{input}` should classify with body `{expected_body}`"
+                ),
+                other => panic!("input `{input}` should classify as Command, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_slash_never_classifies_as_command() {
+        // Names chosen so they are not registered commands AND extremely
+        // unlikely to exist as filesystem paths (would otherwise resolve to
+        // Path via the existence check).
+        for input in ["/foobar", "/foobar arg1 arg2", "/zzzz_not_a_real_cmd_xyz"] {
+            let classified = classify_input(input);
+            assert!(
+                !matches!(classified, InputClass::Command(_)),
+                "input `{input}` must not classify as Command (got {classified:?})"
+            );
+            assert!(
+                matches!(classified, InputClass::UnknownSlash(_)),
+                "input `{input}` should classify as UnknownSlash (got {classified:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_path_input_classifies_as_path_not_command() {
+        for input in [
+            "/no/such/path/here",
+            "/home/me/project",
+            "/var/log/syslog",
+            "/etc/hosts",
+        ] {
+            assert_eq!(
+                classify_input(input),
+                InputClass::Path,
+                "nested absolute path `{input}` should classify as Path"
+            );
+        }
     }
 
     #[test]
