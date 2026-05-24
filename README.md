@@ -113,7 +113,12 @@ and prompt-time skill injection.
    the cursor, and the prompt history.
 2. **Submit**. Pressing Enter classifies the composer text via
    `commands::classify_input`, which has four outcomes:
-   - **`Command`** — first token is in the slash registry. Dispatches.
+   - **`Command`** — first token is in the slash registry. Dispatches the
+     full body verbatim, so `/permissions bypass`, `/profile default`,
+     `/skill clear`, `/provider set abc123`, and friends always reach
+     their handler with their arguments intact. The suggestion palette
+     never overrides a `Command` classification — it only steers Enter
+     when the user is still mid-typing an incomplete or unknown slash.
    - **`Path`** — input starts with `/` and is either an existing path or
      has another `/` in the first whitespace-delimited segment. Submitted
      as prompt text (the agent still sees `/home/me/x`, not a command).
@@ -309,6 +314,32 @@ A skill is injected into the prompt if **either**:
 This is the key change from naïve harnesses that dump every discovered
 skill on every turn; forge keeps the agent's context small unless the
 skill is actually relevant.
+
+### Slash commands
+
+Every `/<name>` is registered in `commands::COMMANDS` exactly once, with a
+category, summary, usage string, and longer help string. Both the TUI
+dispatcher (`terminal_ui::handle_command`) and the plain REPL
+(`main::handle_interactive_command`) read from that registry. The Enter
+handler in the TUI dispatches a typed command verbatim — the fuzzy
+suggestion palette never overrides a complete `Command(_)`
+classification, so `/skill <name>`, `/permissions bypass`, `/profile
+default`, `/provider set abc`, and other arg-bearing forms always reach
+their handler with their arguments intact.
+
+Where the TUI and REPL diverge intentionally:
+
+| Commands | TUI | Plain REPL |
+|---|---|---|
+| `help`, `status`, `clear`, `exit`, `profile`, `profiles`, `model`, `permissions`, `bypass`, `desktop`, `skills`, `skill`, `runs`, `last`, `retry`, `new`, `resume`, `sessions`, `fork`, `compact`, `provider` | dispatched | dispatched |
+| `cancel`, `smoke`, `inspect`, `open-run`, `logs`, `export`, `jobs` | dispatched | prints "only available in the interactive TUI" |
+
+Registry-coverage and classifier tests (`every_registered_command_classifies_as_command`,
+`commands_with_arguments_classify_with_full_body`,
+`unknown_slash_never_classifies_as_command`,
+`nested_path_input_classifies_as_path_not_command`, plus the existing
+`every_command_resolves_via_lookup` / `every_alias_resolves_to_a_known_command`)
+keep the invariants honest as new commands land.
 
 ### TUI affordances
 
