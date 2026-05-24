@@ -400,15 +400,18 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     let (cursor_row, cursor_col) = state.composer.cursor_row_col();
     let visible_rows = input_inner_lines as usize;
     let input_scroll = cursor_row.saturating_sub(visible_rows.saturating_sub(1));
+    let mut composer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" message ");
+    if let Some(chip) = composer_chip(state.composer.text()) {
+        composer_block = composer_block
+            .title_top(Line::from(Span::styled(chip.label(), chip.style())).right_aligned());
+    }
     let input = Paragraph::new(state.composer.text())
         .style(Style::default().fg(Color::White))
         .scroll((input_scroll as u16, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(" message "),
-        );
+        .block(composer_block);
     frame.render_widget(input, chunks[4]);
     set_input_cursor(
         frame,
@@ -765,6 +768,54 @@ fn render_status_bar(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiStat
 /// environment doesn't expose `HOME` (e.g. in some CI sandboxes).
 fn dirs_home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// Right-aligned chip on the composer border that tells the user how Enter
+/// will treat the current text. Returns `None` when the input is empty, a
+/// plain prompt, or a known slash command — i.e. cases where the default look
+/// already communicates intent. Keeping the selector pure makes it testable
+/// without ratatui.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerChip {
+    /// Input looks like a filesystem path; will be sent to the agent as
+    /// prompt text rather than dispatched as a command.
+    Path,
+    /// Input starts with `/` but is neither a known command nor a path;
+    /// Enter will block and surface a "did you mean" hint.
+    UnknownSlash,
+}
+
+impl ComposerChip {
+    fn label(self) -> &'static str {
+        match self {
+            ComposerChip::Path => " path ",
+            ComposerChip::UnknownSlash => " unknown ",
+        }
+    }
+
+    fn style(self) -> Style {
+        match self {
+            ComposerChip::Path => Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+            ComposerChip::UnknownSlash => Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+}
+
+fn composer_chip(input: &str) -> Option<ComposerChip> {
+    if input.trim().is_empty() {
+        return None;
+    }
+    match commands::classify_input(input) {
+        commands::InputClass::Path => Some(ComposerChip::Path),
+        commands::InputClass::UnknownSlash(_) => Some(ComposerChip::UnknownSlash),
+        commands::InputClass::Command(_) | commands::InputClass::Prompt => None,
+    }
 }
 
 /// Pure data backing the persistent bottom status bar. Kept separate from
@@ -2117,6 +2168,49 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn composer_chip_hides_when_empty_or_known_command() {
+        assert_eq!(composer_chip(""), None);
+        assert_eq!(composer_chip("   "), None);
+        assert_eq!(composer_chip("hello there"), None, "plain prompt → no chip");
+        assert_eq!(
+            composer_chip("/help"),
+            None,
+            "known command → no chip; default look applies"
+        );
+        assert_eq!(composer_chip("/skill foo"), None);
+    }
+
+    #[test]
+    fn composer_chip_flags_path_like_input() {
+        assert_eq!(
+            composer_chip("/home/mrmoe28/Project"),
+            Some(ComposerChip::Path)
+        );
+        assert_eq!(
+            composer_chip("/no/such/dir/here"),
+            Some(ComposerChip::Path),
+            "nested missing path still flags as Path via heuristic"
+        );
+    }
+
+    #[test]
+    fn composer_chip_flags_unknown_slash() {
+        assert_eq!(composer_chip("/foobar"), Some(ComposerChip::UnknownSlash));
+    }
+
+    #[test]
+    fn composer_chip_labels_are_padded_and_short() {
+        // Padding spaces on each side keep the chip readable when rendered as
+        // a colored block on the border.
+        let path = ComposerChip::Path.label();
+        assert!(path.starts_with(' ') && path.ends_with(' '));
+        assert!(path.trim().len() <= 10);
+        let unknown = ComposerChip::UnknownSlash.label();
+        assert!(unknown.starts_with(' ') && unknown.ends_with(' '));
+        assert!(unknown.trim().len() <= 10);
+    }
 
     #[test]
     fn status_bar_idle_with_home_abbreviated() {
