@@ -3,13 +3,24 @@
 Interactive harness for external coding agents (opencode, claude, codex, …).
 Wraps the underlying agent subprocess with:
 
-- a streaming TUI built on ratatui
-- persistent sessions you can `/new`, `/resume`, `/sessions`, `/fork`, `/export`
-- a multi-line composer with bracketed paste, prompt history, full cursor &
-  word/line edits
+- a streaming TUI built on ratatui, with a persistent status bar showing
+  run state (`● running 12s` / `○ idle`), session id, cwd (with `$HOME`
+  collapsed to `~`), and permission mode
+- a single input classifier shared by the TUI and the plain REPL that
+  routes between known slash commands, filesystem paths, and prompt text,
+  so pasting an absolute path never gets treated as an unknown command
+  and unknown slashes block with a "did you mean" hint
+- a multi-line composer with bracketed paste, prompt history, full cursor
+  & word/line edits, plus a small border chip (` path ` / ` unknown `)
+  showing how Enter will route the current text
 - a fuzzy slash-command palette with categorized commands and detail panel
+- `Esc` (or `/cancel`) aborts an in-flight run cleanly: the spawned task
+  is dropped, the child agent is reaped via `kill_on_drop`, and a
+  `Run cancelled` line lands in the transcript (with a partial-output
+  note when streams had already opened)
 - guarded-mode approval cards that gate a run before forge actually invokes
   the agent
+- persistent sessions you can `/new`, `/resume`, `/sessions`, `/fork`, `/export`
 - first-class skills with YAML frontmatter (`description`, `triggers`) that
   auto-inject for one turn when a trigger phrase appears in the prompt
 - provider session continuity via per-profile `continue_args` and
@@ -100,9 +111,20 @@ and prompt-time skill injection.
 
 1. **Compose**. Keystrokes flow through `Composer`, which owns the buffer,
    the cursor, and the prompt history.
-2. **Submit**. Pressing Enter calls `composer.submit()`, returning the text.
-   If the input is a slash command, it routes through the `commands`
-   registry; otherwise it becomes a prompt.
+2. **Submit**. Pressing Enter classifies the composer text via
+   `commands::classify_input`, which has four outcomes:
+   - **`Command`** — first token is in the slash registry. Dispatches.
+   - **`Path`** — input starts with `/` and is either an existing path or
+     has another `/` in the first whitespace-delimited segment. Submitted
+     as prompt text (the agent still sees `/home/me/x`, not a command).
+   - **`UnknownSlash`** — starts with `/` but is neither a known command
+     nor a path. Submission is **blocked**; the status bar surfaces an
+     `Unknown command /foobar. Try /<closest>` hint and the composer text
+     is preserved so the user can fix it.
+   - **`Prompt`** — everything else. Submitted as prompt text.
+
+   The same classifier drives the plain REPL, so behaviour is identical
+   between `forge` and `forge --plain`.
 3. **Approval gate**. In guarded mode (no `--bypass` and no `--desktop`),
    the prompt is stashed in `state.pending_approval` and a modal renders
    over the transcript. The agent is **not** spawned until the user
@@ -288,6 +310,52 @@ This is the key change from naïve harnesses that dump every discovered
 skill on every turn; forge keeps the agent's context small unless the
 skill is actually relevant.
 
+### TUI affordances
+
+The visible chrome around the transcript is designed so each piece of
+state has exactly one home and never has to compete for the same row.
+
+- **Top header**: `forge` · profile · permission mode · skill summary.
+  Stable info only; never blinks.
+- **Composer border**: title says ` message ` on the left. On the right,
+  a small chip appears when the current input is non-trivial:
+  - ` path ` (magenta) — input classifies as a filesystem path; Enter
+    sends it as prompt text.
+  - ` unknown ` (red) — input starts with `/` and matches no known
+    command; Enter is blocked.
+
+  Plain prompts and known commands keep the default look, so the border
+  stays quiet during normal typing.
+- **Bottom status bar**: persistent, single line:
+
+  ```
+  ● running 12s  ·  session 4f3a8b  ·  cwd ~/forge-CLI  ·  guarded         Profile switched to dev
+  ```
+
+  The left half is always the same four segments (run state, session id,
+  cwd with `$HOME` collapsed to `~`, mode). The right half carries the
+  ephemeral status message when one is set (`Running…`, `Failed: …`,
+  `Unknown command /…`, etc.), and falls back to `enter send · /help`
+  otherwise. Status messages no longer compete with profile/mode/skills
+  info in the top header.
+- **Run timer**: while a run is in flight, the status bar's run-state
+  segment shows the live elapsed time, scaling from `12s` to `2m05s`.
+
+### Cancellation
+
+While a run is active, **`Esc`** aborts it: the spawned tokio task is
+dropped, which drops the `tokio::process::Child` handle. The agent is
+spawned with `kill_on_drop(true)` so the OS reaps the process. A system
+line `Run cancelled` is pushed to the transcript (with
+`(partial output preserved above)` when stdout or stderr had already
+emitted lines), the status bar flips back to `○ idle`, and the composer
+returns to its normal editable state.
+
+`/cancel` is the slash-command equivalent of the same key, useful in IME
+setups where `Esc` is intercepted. When no run is active, `Esc` falls
+through to the previous behaviour of exiting the TUI; `Ctrl+C` always
+exits regardless.
+
 ### Approval cards
 
 In guarded mode, Enter on a non-slash prompt does **not** spawn the
@@ -329,7 +397,7 @@ the log file but stops allocating strings nobody will read.
 | `src/main.rs` | Clap CLI; plain-mode REPL with full slash-command parity |
 | `src/terminal_ui.rs` | Ratatui TUI: state, render loop, key handling, approval card, suggestion picker |
 | `src/composer.rs` | Multi-line composer (cursor, history, paste, word-level edits) |
-| `src/commands.rs` | Slash command registry, categories, fuzzy matcher |
+| `src/commands.rs` | Slash command registry, categories, fuzzy matcher, input classifier (`InputClass`, `classify_input`) shared by the TUI and the REPL |
 
 ## Status
 
