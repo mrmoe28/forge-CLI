@@ -12,6 +12,7 @@ pub(crate) enum Category {
     Mode,
     Skills,
     Runs,
+    Learning,
     System,
 }
 
@@ -22,6 +23,7 @@ impl Category {
             Category::Mode => "mode",
             Category::Skills => "skills",
             Category::Runs => "runs",
+            Category::Learning => "learning",
             Category::System => "system",
         }
     }
@@ -317,6 +319,15 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "validate the harness environment",
         usage: "/doctor",
         help: "Run a battery of OK/WARN/FAIL checks against the active profile, command binary, cwd, runs/sessions directories, and skills. Use it after editing config or moving directories.",
+        tui: true,
+        plain: true,
+    },
+    SlashCommand {
+        name: "learn",
+        category: Category::Learning,
+        summary: "explicitly save, review, accept, or forget short notes",
+        usage: "/learn <status|save <note>|review|accept <id>|reject <id>|forget <id>|on|off>",
+        help: "Minimal explicit-learning layer. Nothing is captured automatically. `/learn save <note>` writes a pending Markdown note under the learning dir; `/learn review` lists pending notes with ids; `/learn accept <id>` keeps a note, `/learn reject <id>` discards it, `/learn forget <id>` removes an accepted note. `/learn off` and `/learn on` toggle saving; `/learn status` prints counts and the storage path.",
         tui: true,
         plain: true,
     },
@@ -653,6 +664,15 @@ mod tests {
             ("/export out.md", "export out.md"),
             ("/jobs jobs.json 4", "jobs jobs.json 4"),
             ("/smoke Reply exactly: ok", "smoke Reply exactly: ok"),
+            // /learn carries an arbitrary note body verbatim — the dispatcher
+            // re-joins everything after `save` and writes it as the note.
+            (
+                "/learn save prefer rg over grep",
+                "learn save prefer rg over grep",
+            ),
+            ("/learn review", "learn review"),
+            ("/learn status", "learn status"),
+            ("/learn accept ab12", "learn accept ab12"),
             // Leading/trailing whitespace is stripped before classification.
             ("   /profile default   ", "profile default"),
         ] {

@@ -24,6 +24,8 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
+pub mod learning;
+
 pub const DEFAULT_RUNS_DIR: &str = ".codex/external-agent-harness/runs";
 pub const DEFAULT_SESSIONS_DIR: &str = ".codex/external-agent-harness/sessions";
 const DEFAULT_PROFILE: &str = "default";

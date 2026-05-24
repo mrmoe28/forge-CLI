@@ -63,6 +63,7 @@ pub async fn run_terminal_ui(
     config: HarnessConfig,
     runs_dir: PathBuf,
     sessions_dir: PathBuf,
+    learning_dir: PathBuf,
     args: InteractiveArgs,
 ) -> Result<()> {
     let mut terminal = enter_terminal()?;
@@ -77,7 +78,14 @@ pub async fn run_terminal_ui(
     session.timeout_secs = args.timeout_secs;
     save_session(&sessions_dir, &session).await?;
     let skills = discover_skills(&session.cwd).await?;
-    let mut state = TuiState::new(config, session, sessions_dir, runs_dir, skills);
+    let mut state = TuiState::new(
+        config,
+        session,
+        sessions_dir,
+        runs_dir,
+        learning_dir,
+        skills,
+    );
 
     loop {
         terminal.draw(|frame| render(frame, &state))?;
@@ -123,6 +131,7 @@ struct TuiState {
     session: Session,
     sessions_dir: PathBuf,
     runs_dir: PathBuf,
+    learning_dir: PathBuf,
     skills: Vec<Skill>,
     composer: Composer,
     status: String,
@@ -152,6 +161,7 @@ impl TuiState {
         session: Session,
         sessions_dir: PathBuf,
         runs_dir: PathBuf,
+        learning_dir: PathBuf,
         skills: Vec<Skill>,
     ) -> Self {
         let transcript = vec![
@@ -167,6 +177,7 @@ impl TuiState {
             session,
             sessions_dir,
             runs_dir,
+            learning_dir,
             skills,
             composer,
             status: "ready".to_string(),
@@ -1681,6 +1692,7 @@ pub(crate) const TUI_DISPATCHED_COMMANDS: &[&str] = &[
     "provider",
     "jobs",
     "doctor",
+    "learn",
 ];
 
 async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
@@ -2273,6 +2285,21 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             }
             state.push_entries(entries);
             state.status = format!("batch done: {succeeded}/{total} succeeded, {failed} failed");
+            Ok(false)
+        }
+        "learn" => {
+            let args: Vec<&str> = parts.collect();
+            let lines = forge_cli::learning::handle_command(&state.learning_dir, &args).await;
+            let entries: Vec<TranscriptEntry> = lines
+                .iter()
+                .map(|line| TranscriptEntry::system(line.clone()))
+                .collect();
+            // First line doubles as the status bar so it's visible without
+            // scrolling the transcript.
+            if let Some(first) = lines.first() {
+                state.status = first.clone();
+            }
+            state.push_entries(entries);
             Ok(false)
         }
         unknown => {

@@ -40,6 +40,9 @@ struct Cli {
     #[arg(long, global = true)]
     sessions_dir: Option<PathBuf>,
 
+    #[arg(long, global = true)]
+    learning_dir: Option<PathBuf>,
+
     #[clap(flatten)]
     interactive: InteractiveArgs,
 
@@ -167,12 +170,25 @@ async fn main() -> Result<()> {
         Some(path) => path,
         None => forge_cli::default_sessions_dir()?,
     };
+    let learning_dir = match cli.learning_dir {
+        Some(path) => path,
+        None => forge_cli::learning::default_learning_dir()?,
+    };
     let config = load_config(cli.config.as_deref()).await?;
 
     match cli.command {
-        None => interactive_loop(config, runs_dir, sessions_dir, cli.interactive).await,
+        None => {
+            interactive_loop(
+                config,
+                runs_dir,
+                sessions_dir,
+                learning_dir,
+                cli.interactive,
+            )
+            .await
+        }
         Some(Command::Interactive(args)) => {
-            interactive_loop(config, runs_dir, sessions_dir, args).await
+            interactive_loop(config, runs_dir, sessions_dir, learning_dir, args).await
         }
         Some(Command::Run(args)) => {
             let record = run_with_live_output(&config, &runs_dir, args.into_request()).await?;
@@ -295,10 +311,12 @@ async fn interactive_loop(
     config: forge_cli::HarnessConfig,
     runs_dir: PathBuf,
     sessions_dir: PathBuf,
+    learning_dir: PathBuf,
     args: InteractiveArgs,
 ) -> Result<()> {
     if !args.plain && std::io::stdout().is_terminal() {
-        return terminal_ui::run_terminal_ui(config, runs_dir, sessions_dir, args).await;
+        return terminal_ui::run_terminal_ui(config, runs_dir, sessions_dir, learning_dir, args)
+            .await;
     }
 
     let session_cwd = args
@@ -314,6 +332,7 @@ async fn interactive_loop(
     let mut plain = PlainState {
         session,
         sessions_dir,
+        learning_dir,
         skills,
         last_run_id: None,
     };
@@ -405,6 +424,7 @@ async fn interactive_loop(
 struct PlainState {
     session: forge_cli::Session,
     sessions_dir: PathBuf,
+    learning_dir: PathBuf,
     skills: Vec<Skill>,
     last_run_id: Option<String>,
 }
@@ -453,6 +473,7 @@ pub(crate) const PLAIN_DISPATCHED_COMMANDS: &[&str] = &[
     "provider",
     "clear",
     "doctor",
+    "learn",
 ];
 
 /// Names that the plain REPL recognizes only to print a "TUI-only" rejection
@@ -833,6 +854,13 @@ async fn handle_interactive_command(
             // ANSI clear + cursor home. Works in any VT100-ish terminal.
             print!("\x1b[2J\x1b[H");
             std::io::Write::flush(&mut std::io::stdout()).ok();
+            Ok(false)
+        }
+        "learn" => {
+            let args: Vec<&str> = parts.collect();
+            for line in forge_cli::learning::handle_command(&plain.learning_dir, &args).await {
+                println!("{line}");
+            }
             Ok(false)
         }
         cmd @ ("cancel" | "smoke" | "inspect" | "open-run" | "logs" | "export" | "jobs") => {
