@@ -118,3 +118,38 @@ fn cancel_shows_cancel_text_and_does_not_hang() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn learn_save_accept_accepted_and_show_work_in_tui() -> anyhow::Result<()> {
+    let mut harness = PtyHarness::launch_default()?;
+    harness.wait_for_contains("forge")?;
+
+    harness.send_line("/learn save prefer rg for repo searches")?;
+    let saved = harness.wait_for_contains("saved pending note")?;
+    let id = extract_saved_note_id(&saved)?;
+
+    let accept_command = format!("/learn accept {id}");
+    harness.send_line(&accept_command)?;
+    harness.wait_for_contains(&format!("accepted {id}"))?;
+
+    harness.send_line("/learn accepted")?;
+    harness.wait_for_contains("1 accepted note")?;
+    harness.wait_for_contains("prefer rg for repo searches")?;
+
+    let show_command = format!("/learn show {id}");
+    harness.send_line(&show_command)?;
+    harness.wait_for_contains("status: accepted")?;
+    harness.wait_for_contains("prefer rg for repo searches")?;
+    Ok(())
+}
+
+fn extract_saved_note_id(screen: &str) -> anyhow::Result<String> {
+    let Some(index) = screen.find("saved pending note") else {
+        anyhow::bail!("saved note marker missing from screen:\n{screen}");
+    };
+    let after = &screen[index + "saved pending note".len()..];
+    let Some(id) = after.split_whitespace().next() else {
+        anyhow::bail!("saved note id missing from screen:\n{screen}");
+    };
+    Ok(id.to_string())
+}

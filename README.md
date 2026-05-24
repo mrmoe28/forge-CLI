@@ -23,6 +23,8 @@ Wraps the underlying agent subprocess with:
 - persistent sessions you can `/new`, `/resume`, `/sessions`, `/fork`, `/export`
 - first-class skills with YAML frontmatter (`description`, `triggers`) that
   auto-inject for one turn when a trigger phrase appears in the prompt
+- explicit `/learn` notes you can save, review, accept, inspect, and forget
+  without automatic transcript capture or prompt injection
 - provider session continuity via per-profile `continue_args` and
   `session_id_capture_prefix`
 
@@ -59,9 +61,9 @@ session_id_capture_prefix = "session: "
 
 Without `--config`, forge uses a default profile that runs `opencode run`.
 
-State lives under `.codex/external-agent-harness/{runs,sessions}/` in the
-current working directory by default; override with `--runs-dir` /
-`--sessions-dir`.
+State lives under `.codex/external-agent-harness/{runs,sessions,learning}/`
+in the current working directory by default; override with `--runs-dir`,
+`--sessions-dir`, and `--learning-dir`.
 
 ## Architecture
 
@@ -331,7 +333,7 @@ Where the TUI and REPL diverge intentionally:
 
 | Commands | TUI | Plain REPL |
 |---|---|---|
-| `help`, `status`, `clear`, `exit`, `profile`, `profiles`, `model`, `permissions`, `bypass`, `desktop`, `skills`, `skill`, `runs`, `last`, `retry`, `new`, `resume`, `sessions`, `fork`, `compact`, `provider` | dispatched | dispatched |
+| `help`, `status`, `clear`, `exit`, `profile`, `profiles`, `model`, `permissions`, `bypass`, `desktop`, `skills`, `skill`, `runs`, `last`, `retry`, `new`, `resume`, `sessions`, `fork`, `compact`, `provider`, `learn` | dispatched | dispatched |
 | `cancel`, `smoke`, `inspect`, `open-run`, `logs`, `export`, `jobs` | dispatched | prints "only available in the interactive TUI" |
 
 Registry-coverage and classifier tests (`every_registered_command_classifies_as_command`,
@@ -404,6 +406,42 @@ can edit and retry) · `Ctrl+C` exit forge.
 Slash commands bypass the gate (they are internal to forge) and so do
 runs where the user has already opted into `/bypass on` or `/desktop on`.
 
+### Explicit learning
+
+`/learn` is a small, manual note store for things the user explicitly wants
+forge to remember. It does **not** scrape transcripts, generate summaries,
+write prompts automatically, or inject accepted notes into future agent runs.
+Everything starts with a user-typed command.
+
+Default storage:
+
+```text
+.codex/external-agent-harness/learning/
+  pending/<id>.md
+  accepted/<id>.md
+  rejected/<id>.md
+  events.jsonl
+  .disabled
+```
+
+Useful commands:
+
+| Command | Effect |
+|---|---|
+| `/learn` or `/learn status` | Show storage path, note counts, and disabled flag |
+| `/learn save <note>` | Write a pending Markdown note |
+| `/learn review` | List pending notes with ids and previews |
+| `/learn accept <id>` | Move a pending note to accepted |
+| `/learn reject <id>` | Move a pending note to rejected |
+| `/learn accepted` | List accepted notes |
+| `/learn show <id>` | Print a note's status, path, and body |
+| `/learn forget <id>` | Delete an accepted note |
+| `/learn off` / `/learn on` | Disable or re-enable future saves |
+
+Note ids are generated from uuid v4 prefixes and user input is never used in
+filenames. `accept`, `reject`, `show`, and `forget` accept unique id prefixes
+and reject path-like characters before touching the filesystem.
+
 ### Streaming model
 
 The streaming path is what makes the TUI feel live. Two design choices
@@ -429,6 +467,7 @@ the log file but stops allocating strings nobody will read.
 | `src/terminal_ui.rs` | Ratatui TUI: state, render loop, key handling, approval card, suggestion picker |
 | `src/composer.rs` | Multi-line composer (cursor, history, paste, word-level edits) |
 | `src/commands.rs` | Slash command registry, categories, fuzzy matcher, input classifier (`InputClass`, `classify_input`) shared by the TUI and the REPL |
+| `src/learning.rs` | Explicit `/learn` storage: pending/accepted/rejected notes, review/show/forget, disabled marker, events log |
 
 ## Status
 

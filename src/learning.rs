@@ -202,6 +202,37 @@ pub async fn list_accepted(dir: &Path) -> Result<Vec<LearnNote>> {
     list_state(dir, LearnState::Accepted).await
 }
 
+/// Find a note by prefix across pending, accepted, then rejected notes.
+pub async fn show(dir: &Path, id_prefix: &str) -> Result<LearnNote> {
+    if !is_safe_id(id_prefix) {
+        return Err(anyhow!(
+            "invalid id `{id_prefix}`: only [a-z0-9-] characters allowed"
+        ));
+    }
+
+    let mut matches = Vec::new();
+    for state in [
+        LearnState::Pending,
+        LearnState::Accepted,
+        LearnState::Rejected,
+    ] {
+        matches.extend(
+            list_state(dir, state)
+                .await?
+                .into_iter()
+                .filter(|note| note.id.starts_with(id_prefix)),
+        );
+    }
+
+    match matches.len() {
+        0 => Err(anyhow!("no learned note matches `{id_prefix}`")),
+        1 => Ok(matches.remove(0)),
+        n => Err(anyhow!(
+            "id prefix `{id_prefix}` is ambiguous; matched {n} notes"
+        )),
+    }
+}
+
 /// Move a pending note (`id_prefix` matches the start of an id) to accepted.
 pub async fn accept(dir: &Path, id_prefix: &str) -> Result<LearnNote> {
     move_note(dir, id_prefix, LearnState::Pending, LearnState::Accepted).await
@@ -241,7 +272,7 @@ pub async fn handle_command(dir: &Path, args: &[&str]) -> Vec<String> {
                     s.pending, s.accepted, s.rejected, s.disabled
                 ),
                 format!(
-                    "subcommands: save <note> | review | accept <id> | reject <id> | forget <id> | on | off"
+                    "subcommands: save <note> | review | accepted | show <id> | accept <id> | reject <id> | forget <id> | on | off"
                 ),
             ],
             Err(err) => vec![format!("/learn status failed: {err}")],
@@ -263,21 +294,31 @@ pub async fn handle_command(dir: &Path, args: &[&str]) -> Vec<String> {
         Some("review") => match list_pending(dir).await {
             Ok(notes) if notes.is_empty() => vec!["no pending notes".to_string()],
             Ok(notes) => {
-                let mut lines = vec![format!("{} pending note(s):", notes.len())];
-                for note in notes {
-                    lines.push(format!(
-                        "  {}  {}  {}",
-                        note.id,
-                        note.created_at.format("%Y-%m-%d %H:%M"),
-                        note.preview(72)
-                    ));
-                }
+                let mut lines = format_note_list("pending", notes);
                 lines.push(
                     "accept with /learn accept <id> or discard with /learn reject <id>".to_string(),
                 );
                 lines
             }
             Err(err) => vec![format!("/learn review failed: {err}")],
+        },
+        Some("accepted") => match list_accepted(dir).await {
+            Ok(notes) if notes.is_empty() => vec!["no accepted notes".to_string()],
+            Ok(notes) => {
+                let mut lines = format_note_list("accepted", notes);
+                lines.push(
+                    "inspect with /learn show <id>; remove with /learn forget <id>".to_string(),
+                );
+                lines
+            }
+            Err(err) => vec![format!("/learn accepted failed: {err}")],
+        },
+        Some("show") => match args.get(1) {
+            None => vec!["Usage: /learn show <id>".to_string()],
+            Some(id) => match show(dir, id).await {
+                Ok(note) => format_note_detail(&note),
+                Err(err) => vec![format!("/learn show failed: {err}")],
+            },
         },
         Some("accept") => match args.get(1) {
             None => vec!["Usage: /learn accept <id>".to_string()],
@@ -313,6 +354,35 @@ pub async fn handle_command(dir: &Path, args: &[&str]) -> Vec<String> {
         },
         Some(other) => vec![format!("unknown /learn subcommand `{other}`; see /help")],
     }
+}
+
+fn format_note_list(label: &str, notes: Vec<LearnNote>) -> Vec<String> {
+    let mut lines = vec![format!("{} {label} note(s):", notes.len())];
+    for note in notes {
+        lines.push(format!(
+            "  {}  {}  {}",
+            note.id,
+            note.created_at.format("%Y-%m-%d %H:%M"),
+            note.preview(72)
+        ));
+    }
+    lines
+}
+
+fn format_note_detail(note: &LearnNote) -> Vec<String> {
+    let mut lines = vec![
+        format!("learned note {}", note.id),
+        format!("status: {}", note.state.as_str()),
+        format!(
+            "created_at: {}",
+            note.created_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+        format!("path: {}", note.path.display()),
+        String::new(),
+    ];
+    lines.extend(note.body.lines().map(str::to_string));
+    lines
 }
 
 // ----------------------------------------------------------------------------
@@ -638,12 +708,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn show_finds_note_across_states_and_returns_detail_lines() -> Result<()> {
+        let temp = TempDir::new()?;
+        let dir = temp.path().to_path_buf();
+        let note = save_pending(&dir, "remember this\nsecond line").await?;
+        let accepted = accept(&dir, &note.id).await?;
+
+        let shown = show(&dir, &accepted.id[..4]).await?;
+        assert_eq!(shown.id, accepted.id);
+        assert_eq!(shown.state, LearnState::Accepted);
+
+        let lines = handle_command(&dir, &["show", &accepted.id[..4]]).await;
+        assert!(lines.iter().any(|line| line == "status: accepted"));
+        assert!(lines.iter().any(|line| line == "remember this"));
+        assert!(lines.iter().any(|line| line == "second line"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_subcommand_lists_accepted_notes() -> Result<()> {
+        let temp = TempDir::new()?;
+        let dir = temp.path().to_path_buf();
+        let note = save_pending(&dir, "accepted preview body").await?;
+        let accepted = accept(&dir, &note.id).await?;
+
+        let lines = handle_command(&dir, &["accepted"]).await;
+        assert!(lines[0].contains("1 accepted note"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&accepted.id) && line.contains("accepted preview body")),
+            "accepted output: {lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("/learn show")));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn unsafe_id_is_rejected_at_lookup() {
         let temp = TempDir::new().unwrap();
         let err = accept(temp.path(), "../etc").await.unwrap_err();
         assert!(err.to_string().contains("invalid id"));
         let err = forget(temp.path(), "a/b").await.unwrap_err();
         assert!(err.to_string().contains("invalid id"));
+        let lines = handle_command(temp.path(), &["show", "../etc"]).await;
+        assert!(lines[0].contains("invalid id"));
     }
 
     #[tokio::test]
