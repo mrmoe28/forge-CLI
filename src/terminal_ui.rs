@@ -14,6 +14,7 @@ use crossterm::event::KeyModifiers;
 use crossterm::execute;
 use crossterm::terminal;
 use forge_cli::HarnessConfig;
+use forge_cli::JobSpec;
 use forge_cli::RunEvent;
 use forge_cli::RunRecord;
 use forge_cli::RunRequest;
@@ -58,6 +59,8 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
+
+const MAX_SPAWN_AGENTS: usize = 8;
 
 pub async fn run_terminal_ui(
     config: HarnessConfig,
@@ -1727,6 +1730,7 @@ pub(crate) const TUI_DISPATCHED_COMMANDS: &[&str] = &[
     "export",
     "provider",
     "jobs",
+    "spawn",
     "doctor",
     "learn",
 ];
@@ -2323,6 +2327,83 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             state.status = format!("batch done: {succeeded}/{total} succeeded, {failed} failed");
             Ok(false)
         }
+        "spawn" => {
+            if state.active_run.is_some() {
+                state.status = "Run already in progress".to_string();
+                return Ok(false);
+            }
+            let Some((count, prompt)) = parse_spawn_command(command) else {
+                state.status = "Usage: /spawn <count> <prompt>".to_string();
+                return Ok(false);
+            };
+            if count == 0 || count > MAX_SPAWN_AGENTS {
+                state.status = format!("spawn count must be 1..={MAX_SPAWN_AGENTS}");
+                return Ok(false);
+            }
+
+            state.push_system(format!(
+                "spawn: launching {count} agent(s) concurrently with profile `{}`",
+                state.session.profile
+            ));
+            state.push_system(format!("prompt: {}", TruncDisplay(&prompt, 120)));
+
+            let jobs = (1..=count)
+                .map(|index| JobSpec {
+                    prompt: prompt.clone(),
+                    id: Some(format!("spawn-{index}")),
+                    profile: Some(state.session.profile.clone()),
+                    cwd: Some(state.session.cwd.clone()),
+                    timeout_secs: state.session.timeout_secs,
+                    bypass_permissions: state.session.bypass,
+                    desktop_control: state.session.desktop,
+                    label: Some(format!("spawn-{index}")),
+                    skills: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            let results =
+                forge_cli::run_jobs(state.config.clone(), state.runs_dir.clone(), jobs, count)
+                    .await;
+
+            let mut succeeded = 0usize;
+            let mut failed = 0usize;
+            let mut entries = Vec::with_capacity(results.len() + 1);
+            for (index, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok(record) => {
+                        if record.status == RunStatus::Succeeded {
+                            succeeded += 1;
+                        } else {
+                            failed += 1;
+                        }
+                        entries.push(TranscriptEntry::system(format!(
+                            "spawn result {}: {} {:?} duration={}ms stdout={} stderr={}",
+                            index + 1,
+                            record.id,
+                            record.status,
+                            record.duration_ms,
+                            record.stdout_log.display(),
+                            record.stderr_log.display()
+                        )));
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        entries.push(TranscriptEntry::error(format!(
+                            "spawn result {} failed: {err:#}",
+                            index + 1
+                        )));
+                    }
+                }
+            }
+            entries.insert(
+                0,
+                TranscriptEntry::system(format!(
+                    "spawn done: {succeeded}/{count} succeeded, {failed} failed"
+                )),
+            );
+            state.push_entries(entries);
+            state.status = format!("spawn done: {succeeded}/{count} succeeded, {failed} failed");
+            Ok(false)
+        }
         "learn" => {
             let args: Vec<&str> = parts.collect();
             let lines = forge_cli::learning::handle_command(&state.learning_dir, &args).await;
@@ -2342,6 +2423,29 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             state.status = format!("Unknown command: /{unknown}");
             Ok(false)
         }
+    }
+}
+
+fn parse_spawn_command(command: &str) -> Option<(usize, String)> {
+    let rest = command.trim().strip_prefix("spawn")?.trim_start();
+    let (count, prompt) = rest.split_once(char::is_whitespace)?;
+    let count = count.parse::<usize>().ok()?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return None;
+    }
+    Some((count, prompt.to_string()))
+}
+
+struct TruncDisplay<'a>(&'a str, usize);
+
+impl std::fmt::Display for TruncDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.chars().count() <= self.1 {
+            return f.write_str(self.0);
+        }
+        let truncated: String = self.0.chars().take(self.1).collect();
+        write!(f, "{truncated}…")
     }
 }
 

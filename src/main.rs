@@ -481,7 +481,7 @@ pub(crate) const PLAIN_DISPATCHED_COMMANDS: &[&str] = &[
 /// arm and the registry's `is_tui_only()` flag agree.
 #[allow(dead_code)]
 pub(crate) const PLAIN_TUI_ONLY_COMMANDS: &[&str] = &[
-    "cancel", "smoke", "inspect", "open-run", "logs", "export", "jobs",
+    "cancel", "smoke", "inspect", "open-run", "logs", "export", "jobs", "spawn",
 ];
 
 async fn handle_interactive_command(
@@ -863,7 +863,8 @@ async fn handle_interactive_command(
             }
             Ok(false)
         }
-        cmd @ ("cancel" | "smoke" | "inspect" | "open-run" | "logs" | "export" | "jobs") => {
+        cmd @ ("cancel" | "smoke" | "inspect" | "open-run" | "logs" | "export" | "jobs"
+        | "spawn") => {
             println!(
                 "/{cmd} is only available in the interactive TUI. Run `forge` without `--plain` to use it."
             );

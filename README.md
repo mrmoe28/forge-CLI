@@ -16,6 +16,8 @@ Wraps the underlying agent subprocess with:
 - a fuzzy slash-command palette with categorized commands and detail panel
 - structured run transcript markers (`thinking:`, `output:`, `errors:`,
   `done:` / `failed:`) so streamed agent output is easier to scan
+- `/spawn <count> <prompt>` to fan one prompt out to multiple concurrent
+  agents and compare their run logs
 - `Esc` (or `/cancel`) aborts an in-flight run cleanly: the spawned task
   is dropped, the child agent is reaped via `kill_on_drop`, and a
   `Run cancelled` line lands in the transcript (with a partial-output
@@ -336,7 +338,7 @@ Where the TUI and REPL diverge intentionally:
 | Commands | TUI | Plain REPL |
 |---|---|---|
 | `help`, `status`, `clear`, `exit`, `profile`, `profiles`, `model`, `permissions`, `bypass`, `desktop`, `skills`, `skill`, `runs`, `last`, `retry`, `new`, `resume`, `sessions`, `fork`, `compact`, `provider`, `learn` | dispatched | dispatched |
-| `cancel`, `smoke`, `inspect`, `open-run`, `logs`, `export`, `jobs` | dispatched | prints "only available in the interactive TUI" |
+| `cancel`, `smoke`, `inspect`, `open-run`, `logs`, `export`, `jobs`, `spawn` | dispatched | prints "only available in the interactive TUI" |
 
 Registry-coverage and classifier tests (`every_registered_command_classifies_as_command`,
 `commands_with_arguments_classify_with_full_body`,
@@ -464,6 +466,21 @@ matter:
 If the consumer of `run_agent_streaming` drops its receiver mid-run, the
 streaming pipe falls back to a `drain_pipe` path that keeps writing to
 the log file but stops allocating strings nobody will read.
+
+### Parallel agents
+
+`/spawn <count> <prompt>` launches several independent agent runs at once
+using the active profile, cwd, timeout, and permission mode. It is intended
+for quick comparison work such as:
+
+```text
+/spawn 3 propose different fixes for the failing parser test
+```
+
+Spawned runs are not streamed into separate panes yet; forge waits for the
+batch to finish, then prints one summary line per result with run id, status,
+duration, and stdout/stderr log paths. `count` is capped at 8 to avoid
+accidental process storms.
 
 ## File map
 

@@ -305,6 +305,15 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         plain: false,
     },
     SlashCommand {
+        name: "spawn",
+        category: Category::Runs,
+        summary: "fan one prompt out to multiple agents",
+        usage: "/spawn <count> <prompt>",
+        help: "Run <count> independent agents concurrently using the active profile, cwd, and permission mode. Results are summarized with run ids and log paths. The TUI is unresponsive until the spawn batch completes; cancel with Ctrl+C.",
+        tui: true,
+        plain: false,
+    },
+    SlashCommand {
         name: "provider",
         category: Category::Session,
         summary: "inspect or set the provider session id",
@@ -663,6 +672,7 @@ mod tests {
             ("/open-run abcdef", "open-run abcdef"),
             ("/export out.md", "export out.md"),
             ("/jobs jobs.json 4", "jobs jobs.json 4"),
+            ("/spawn 3 compare approaches", "spawn 3 compare approaches"),
             ("/smoke Reply exactly: ok", "smoke Reply exactly: ok"),
             // /learn carries an arbitrary note body verbatim — the dispatcher
             // re-joins everything after `save` and writes it as the note.
@@ -1022,6 +1032,7 @@ mod tests {
             "/desktop off",
             "/compact 50",
             "/jobs jobs.json 4",
+            "/spawn 3 compare approaches",
         ] {
             assert!(
                 matches!(route_enter(input), EnterRoute::Command(_)),

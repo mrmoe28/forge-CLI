@@ -78,6 +78,20 @@ fn run_output_uses_structured_activity_sections() -> anyhow::Result<()> {
 }
 
 #[test]
+fn spawn_fans_prompt_out_to_multiple_agents() -> anyhow::Result<()> {
+    let mut harness = PtyHarness::launch_default()?;
+    harness.wait_for_contains("forge")?;
+
+    harness.send_line("/spawn 2 compare approaches")?;
+    harness.wait_for_contains("spawn: launching 2 agent")?;
+    harness.wait_for_contains("prompt: compare approaches")?;
+    harness.wait_for_contains("spawn done: 2/2 succeeded, 0 failed")?;
+    harness.wait_for_contains("spawn result 1:")?;
+    harness.wait_for_contains("spawn result 2:")?;
+    Ok(())
+}
+
+#[test]
 fn transcript_overflows_and_can_be_scrolled() -> anyhow::Result<()> {
     let mut harness = PtyHarness::launch(HarnessConfig::default_fast().size(18, 100))?;
     harness.wait_for_contains("forge")?;
