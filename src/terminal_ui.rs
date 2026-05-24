@@ -51,6 +51,7 @@ use ratatui::widgets::Wrap;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
@@ -244,6 +245,7 @@ impl TuiState {
 struct ActiveRun {
     handle: JoinHandle<Result<RunRecord>>,
     rx: UnboundedReceiver<RunEvent>,
+    started_at: Instant,
     assistant_open: bool,
     error_open: bool,
     /// Concatenated stdout lines, separated by `\n`, captured so the final
@@ -704,7 +706,10 @@ fn render_status_bar(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiStat
         &state.session.cwd,
         home.as_deref(),
         mode_label(state),
-        state.active_run.is_some(),
+        state
+            .active_run
+            .as_ref()
+            .map(|active| active.started_at.elapsed()),
         &state.status,
     );
 
@@ -822,7 +827,7 @@ fn composer_chip(input: &str) -> Option<ComposerChip> {
 /// rendering so the layout can be unit-tested without standing up a terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatusBarData {
-    run_state: &'static str,
+    run_state: String,
     session: String,
     cwd: String,
     mode: &'static str,
@@ -836,10 +841,13 @@ fn build_status_bar_data(
     cwd: &std::path::Path,
     home: Option<&std::path::Path>,
     mode: &'static str,
-    running: bool,
+    running_elapsed: Option<Duration>,
     ephemeral: &str,
 ) -> StatusBarData {
-    let run_state = if running { "● running" } else { "○ idle" };
+    let run_state = match running_elapsed {
+        Some(elapsed) => format!("● running {}", format_run_elapsed(elapsed)),
+        None => "○ idle".to_string(),
+    };
     let cwd_display = abbreviate_home(cwd, home);
     let message = if ephemeral.trim().is_empty() {
         None
@@ -853,6 +861,16 @@ fn build_status_bar_data(
         mode,
         message,
     }
+}
+
+fn format_run_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    let secs = secs % 60;
+    format!("{mins}m{secs:02}s")
 }
 
 /// Replace the user's home prefix with `~` so the cwd fits on a single line.
@@ -1358,6 +1376,7 @@ fn start_run(state: &mut TuiState, prompt: String) {
     state.active_run = Some(ActiveRun {
         handle,
         rx,
+        started_at: Instant::now(),
         assistant_open: false,
         error_open: false,
         assistant_buffer: String::new(),
@@ -1684,6 +1703,18 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             };
             let transcript = read_transcript(&record).await?;
             state.push_entries(render_record(&record, transcript));
+            Ok(false)
+        }
+        "cancel" => {
+            if cancel_active_run(
+                &mut state.active_run,
+                &mut state.transcript,
+                &mut state.status,
+            ) {
+                state.scroll = u16::MAX;
+            } else {
+                state.status = "No active run to cancel".to_string();
+            }
             Ok(false)
         }
         "retry" => {
@@ -2216,7 +2247,7 @@ mod tests {
     fn status_bar_idle_with_home_abbreviated() {
         let cwd = std::path::PathBuf::from("/home/me/forge-CLI");
         let home = std::path::PathBuf::from("/home/me");
-        let data = build_status_bar_data("4f3a8b", &cwd, Some(&home), "guarded", false, "");
+        let data = build_status_bar_data("4f3a8b", &cwd, Some(&home), "guarded", None, "");
         assert_eq!(data.run_state, "○ idle");
         assert_eq!(data.session, "session 4f3a8b");
         assert_eq!(data.cwd, "cwd ~/forge-CLI");
@@ -2227,17 +2258,38 @@ mod tests {
     #[test]
     fn status_bar_running_shows_running_marker_and_message() {
         let cwd = std::path::PathBuf::from("/tmp/repo");
-        let data = build_status_bar_data("abcdef", &cwd, None, "bypass", true, "Running…");
-        assert_eq!(data.run_state, "● running");
+        let data = build_status_bar_data(
+            "abcdef",
+            &cwd,
+            None,
+            "bypass",
+            Some(Duration::from_secs(12)),
+            "Running…",
+        );
+        assert_eq!(data.run_state, "● running 12s");
         assert_eq!(data.cwd, "cwd /tmp/repo", "no home → keep absolute path");
         assert_eq!(data.mode, "bypass");
         assert_eq!(data.message.as_deref(), Some("Running…"));
     }
 
     #[test]
+    fn status_bar_running_timer_formats_minutes() {
+        let cwd = std::path::PathBuf::from("/tmp/repo");
+        let data = build_status_bar_data(
+            "abcdef",
+            &cwd,
+            None,
+            "bypass",
+            Some(Duration::from_secs(125)),
+            "",
+        );
+        assert_eq!(data.run_state, "● running 2m05s");
+    }
+
+    #[test]
     fn status_bar_trims_whitespace_only_messages() {
         let cwd = std::path::PathBuf::from("/x");
-        let data = build_status_bar_data("a", &cwd, None, "guarded", false, "   \t  ");
+        let data = build_status_bar_data("a", &cwd, None, "guarded", None, "   \t  ");
         assert!(
             data.message.is_none(),
             "whitespace-only ephemeral status must collapse to None"
@@ -2295,6 +2347,7 @@ mod tests {
         let mut active_run = Some(ActiveRun {
             handle,
             rx,
+            started_at: Instant::now(),
             assistant_open: false,
             error_open: false,
             assistant_buffer: String::new(),
@@ -2325,6 +2378,7 @@ mod tests {
         let mut active_run = Some(ActiveRun {
             handle,
             rx,
+            started_at: Instant::now(),
             assistant_open: true,
             error_open: false,
             assistant_buffer: "partial response so far".to_string(),

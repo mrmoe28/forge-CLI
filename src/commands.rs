@@ -136,6 +136,13 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         help: "Show the transcript of the most recent run in this session.",
     },
     SlashCommand {
+        name: "cancel",
+        category: Category::Runs,
+        summary: "cancel the active run",
+        usage: "/cancel",
+        help: "Cancel the currently running agent invocation. This is the slash-command equivalent of pressing Esc while a run is active.",
+    },
+    SlashCommand {
         name: "retry",
         category: Category::Runs,
         summary: "retry a run",

@@ -787,7 +787,7 @@ async fn handle_interactive_command(
             std::io::Write::flush(&mut std::io::stdout()).ok();
             Ok(false)
         }
-        cmd @ ("smoke" | "inspect" | "open-run" | "logs" | "export" | "jobs") => {
+        cmd @ ("cancel" | "smoke" | "inspect" | "open-run" | "logs" | "export" | "jobs") => {
             println!(
                 "/{cmd} is only available in the interactive TUI. Run `forge` without `--plain` to use it."
             );
