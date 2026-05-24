@@ -107,6 +107,11 @@ pub enum RunStatus {
     Succeeded,
     Failed,
     TimedOut,
+    /// The caller fired the cancel signal threaded into
+    /// [`run_agent_streaming`]. The agent process was sent SIGTERM and (if it
+    /// did not exit within the grace window) SIGKILL. Persisted records keep
+    /// whatever the process flushed before exiting.
+    Cancelled,
 }
 
 /// Live event emitted by [`run_agent_streaming`].
@@ -562,7 +567,7 @@ pub async fn run_agent(
 ) -> Result<RunRecord> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let result = run_agent_streaming(config, runs_dir, request, tx).await;
+    let result = run_agent_streaming(config, runs_dir, request, tx, None).await;
     drain.await.context("event drain task failed")?;
     result
 }
@@ -572,11 +577,20 @@ pub async fn run_agent(
 /// also delivered through the channel as a final [`RunEvent::Completed`] so
 /// receivers that only watch the channel can react to completion without
 /// awaiting the task handle separately.
+///
+/// When `cancel` is `Some`, callers may fire the corresponding
+/// [`oneshot::Sender`] to request a graceful shutdown. On Unix the child is
+/// sent SIGTERM, given up to [`GRACEFUL_CANCEL_GRACE`] to exit on its own, and
+/// then SIGKILL'd via [`tokio::process::Child::kill`]. On Windows there is no
+/// SIGTERM equivalent so the cancel path goes straight to `kill`. The dropped
+/// or fired `Sender` both count as "no cancel requested" only when dropped
+/// without sending; a successful `send(())` always escalates.
 pub async fn run_agent_streaming(
     config: &HarnessConfig,
     runs_dir: &Path,
     request: RunRequest,
     events: UnboundedSender<RunEvent>,
+    cancel: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<RunRecord> {
     let profile = config
         .profiles
@@ -621,6 +635,14 @@ pub async fn run_agent_streaming(
     // the user cancels an in-flight run from the TUI). Without this, an Esc
     // press would orphan the agent process.
     command.kill_on_drop(true);
+    // Put the child in its own process group so cancellation can signal the
+    // entire tree (sh wrappers that fork grandchildren, multi-process agents,
+    // etc.). Without this, sending SIGTERM to the immediate child kills the
+    // shell wrapper but leaves grandchildren holding the stdout/stderr pipes
+    // open, wedging `stream_pipe` until they finish on their own. See the
+    // `finish_cancel` group-kill below.
+    #[cfg(unix)]
+    command.process_group(0);
 
     let mut child = command
         .spawn()
@@ -655,24 +677,7 @@ pub async fn run_agent_streaming(
     ));
 
     let started = std::time::Instant::now();
-    let wait_result = match timeout_secs {
-        Some(seconds) => {
-            match tokio::time::timeout(Duration::from_secs(seconds), child.wait()).await {
-                Ok(wait) => WaitOutcome::Exited(wait.context("failed while waiting for agent")?),
-                Err(_) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    WaitOutcome::TimedOut
-                }
-            }
-        }
-        None => WaitOutcome::Exited(
-            child
-                .wait()
-                .await
-                .context("failed while waiting for agent")?,
-        ),
-    };
+    let wait_result = wait_for_child(&mut child, timeout_secs, cancel).await?;
     let duration_ms = started.elapsed().as_millis();
     stdout_task.await.context("stdout task failed")??;
     stderr_task.await.context("stderr task failed")??;
@@ -683,6 +688,7 @@ pub async fn run_agent_streaming(
         }
         WaitOutcome::Exited(exit_status) => (RunStatus::Failed, exit_status.code()),
         WaitOutcome::TimedOut => (RunStatus::TimedOut, None),
+        WaitOutcome::Cancelled => (RunStatus::Cancelled, None),
     };
     let captured_session_id = match profile.session_id_capture_prefix.as_deref() {
         Some(prefix) if !prefix.is_empty() => {
@@ -1113,6 +1119,469 @@ async fn read_optional_string(path: &Path) -> Result<String> {
 enum WaitOutcome {
     Exited(ExitStatus),
     TimedOut,
+    /// The cancel signal threaded into [`run_agent_streaming`] fired. The
+    /// child was sent SIGTERM and (after the grace window) SIGKILL; whatever
+    /// it flushed before exiting is preserved in the captured stdout/stderr.
+    Cancelled,
+}
+
+/// How long to wait between SIGTERM and SIGKILL when a cancel is requested.
+/// Long enough for a well-behaved CLI to flush stdout and exit cleanly; short
+/// enough that the TUI reflects the cancel within a couple of poll ticks.
+const GRACEFUL_CANCEL_GRACE: Duration = Duration::from_millis(200);
+
+async fn wait_for_child(
+    child: &mut tokio::process::Child,
+    timeout_secs: Option<u64>,
+    cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<WaitOutcome> {
+    // Reduce both branches to the same "wait for cancel or exit" select. When
+    // there's no cancel channel we fall back to a future that never resolves.
+    let cancel = async move {
+        match cancel {
+            Some(rx) => {
+                // Treat both a successful `send(())` and a dropped sender as
+                // "no cancel requested" unless we actually receive a value.
+                // (A dropped sender returns Err, which we ignore — the caller
+                // chose not to fire it.)
+                if rx.await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+            None => {
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::pin!(cancel);
+
+    match timeout_secs {
+        Some(seconds) => {
+            tokio::select! {
+                biased;
+                _ = &mut cancel => {
+                    finish_cancel(child).await;
+                    Ok(WaitOutcome::Cancelled)
+                }
+                res = tokio::time::timeout(Duration::from_secs(seconds), child.wait()) => match res {
+                    Ok(wait) => Ok(WaitOutcome::Exited(
+                        wait.context("failed while waiting for agent")?,
+                    )),
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        Ok(WaitOutcome::TimedOut)
+                    }
+                }
+            }
+        }
+        None => {
+            tokio::select! {
+                biased;
+                _ = &mut cancel => {
+                    finish_cancel(child).await;
+                    Ok(WaitOutcome::Cancelled)
+                }
+                res = child.wait() => Ok(WaitOutcome::Exited(
+                    res.context("failed while waiting for agent")?,
+                )),
+            }
+        }
+    }
+}
+
+/// Graceful-cancel epilogue: SIGTERM on Unix, wait up to
+/// [`GRACEFUL_CANCEL_GRACE`], then SIGKILL via [`Child::kill`]. On Windows
+/// (no SIGTERM) we go straight to `kill`.
+async fn finish_cancel(child: &mut tokio::process::Child) {
+    // Signal the *process group* (negative pid in kill(2)), not just the
+    // immediate child. `run_agent_streaming` puts the child in its own group
+    // via `Command::process_group(0)`, so the child's pid IS the pgid and
+    // `kill(-pid, sig)` reaches sh wrappers AND any grandchildren they
+    // fork()'d. The leader-only fallback (`child.kill()`) is kept for the
+    // non-unix path and as a belt-and-braces SIGKILL.
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            let pgid = -(pid as i32);
+            // SAFETY: kill(2) is async-signal-safe and accepts any pid; an
+            // invalid pid just returns ESRCH which we ignore. The pid came
+            // from a still-living child reference held by `child`.
+            unsafe {
+                libc::kill(pgid as libc::pid_t, libc::SIGTERM);
+            }
+            if tokio::time::timeout(GRACEFUL_CANCEL_GRACE, child.wait())
+                .await
+                .is_ok()
+            {
+                // Leader reaped, but grandchildren may still be in the
+                // group draining pipes. Sweep them with SIGKILL — at this
+                // point any orderly shutdown has already happened, so it's
+                // safe to force the rest down.
+                unsafe {
+                    libc::kill(pgid as libc::pid_t, libc::SIGKILL);
+                }
+                return;
+            }
+            // Grace expired: SIGKILL the whole group.
+            unsafe {
+                libc::kill(pgid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+// ---------------------------------------------------------------------------
+// /doctor — environment validation. Pure helpers live here so both the TUI
+// and the plain REPL can call `run_doctor` and just format the results.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorLevel {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl DoctorLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            DoctorLevel::Ok => "OK",
+            DoctorLevel::Warn => "WARN",
+            DoctorLevel::Fail => "FAIL",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorCheck {
+    pub level: DoctorLevel,
+    /// Short identifier (e.g. "profile", "cwd"). Stable across runs so the
+    /// user can grep for it.
+    pub name: String,
+    /// One-line human-readable status. Should be concise but actionable.
+    pub detail: String,
+}
+
+impl DoctorCheck {
+    pub fn ok(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            level: DoctorLevel::Ok,
+            name: name.into(),
+            detail: detail.into(),
+        }
+    }
+    pub fn warn(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            level: DoctorLevel::Warn,
+            name: name.into(),
+            detail: detail.into(),
+        }
+    }
+    pub fn fail(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            level: DoctorLevel::Fail,
+            name: name.into(),
+            detail: detail.into(),
+        }
+    }
+
+    /// Render as a single line: `[LEVEL] name: detail`.
+    pub fn format_line(&self) -> String {
+        format!("[{}] {}: {}", self.level.label(), self.name, self.detail)
+    }
+}
+
+/// Pure: validate that `profile_name` exists in `config` and points to a
+/// non-empty command vector. Returns either a single Ok or a Fail check.
+pub fn check_profile(config: &HarnessConfig, profile_name: &str) -> DoctorCheck {
+    match config.profiles.get(profile_name) {
+        None => DoctorCheck::fail(
+            "profile",
+            format!(
+                "active profile `{profile_name}` is not defined in config (available: {})",
+                if config.profiles.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    config
+                        .profiles
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ),
+        ),
+        Some(profile) if profile.command.is_empty() => DoctorCheck::fail(
+            "profile.command",
+            format!("profile `{profile_name}` has an empty command vector"),
+        ),
+        Some(profile) => DoctorCheck::ok(
+            "profile",
+            format!("`{profile_name}` -> {}", profile.command.join(" ")),
+        ),
+    }
+}
+
+/// Pure: walk `path_env` (a colon-separated PATH string on Unix, semicolon on
+/// Windows) looking for `name`. Returns the first directory containing `name`
+/// as a regular file. Executable-bit screening is the caller's job (see
+/// [`is_executable_file`]) — that way this helper stays usable for the broader
+/// "is the binary on PATH at all?" question even when the file is present but
+/// non-executable.
+pub fn find_on_path(path_env: &str, name: &str) -> Option<PathBuf> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    for dir in path_env.split(sep).filter(|s| !s.is_empty()) {
+        let candidate = PathBuf::from(dir).join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Return true when `path` exists, is a regular file, and is executable by
+/// the current process. On Unix this checks at least one of the user/group/
+/// other execute bits is set — `Command::spawn` will still reject the file
+/// if effective uid/gid don't match, but coarse-grained "any x bit?" catches
+/// the common typo case (file installed without `chmod +x`). On non-Unix the
+/// concept doesn't apply; we fall back to "is the file present?".
+pub fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Check that the first token of the profile command is locatable AND
+/// executable. Bare names are searched on PATH; absolute paths are stat'd
+/// directly. Anything else (e.g. a `./script` relative path) is reported as
+/// Warn — we can't resolve it without knowing the cwd at exec time.
+///
+/// On Unix, a resolved file that exists but lacks any execute bit is reported
+/// as Fail so `chmod +x`-style typos surface here rather than as an opaque
+/// "Permission denied" mid-run.
+pub fn check_command_binary(profile: &AgentProfile, path_env: Option<&str>) -> DoctorCheck {
+    let Some(bin) = profile.command.first() else {
+        return DoctorCheck::fail("profile.command", "command vector is empty");
+    };
+    let path = std::path::Path::new(bin);
+    if path.is_absolute() {
+        if !path.is_file() {
+            return DoctorCheck::fail(
+                "command.binary",
+                format!("`{bin}` (absolute path) does not exist or is not a file"),
+            );
+        }
+        return if is_executable_file(path) {
+            DoctorCheck::ok(
+                "command.binary",
+                format!("`{bin}` exists and is executable"),
+            )
+        } else {
+            DoctorCheck::fail(
+                "command.binary",
+                format!("`{bin}` exists but is not executable (try `chmod +x`)"),
+            )
+        };
+    }
+    if bin.contains('/') || bin.contains('\\') {
+        return DoctorCheck::warn(
+            "command.binary",
+            format!("`{bin}` is a relative path; resolution depends on run cwd"),
+        );
+    }
+    match path_env.and_then(|env| find_on_path(env, bin)) {
+        Some(found) => {
+            if is_executable_file(&found) {
+                DoctorCheck::ok(
+                    "command.binary",
+                    format!("`{bin}` found at {}", found.display()),
+                )
+            } else {
+                DoctorCheck::fail(
+                    "command.binary",
+                    format!(
+                        "`{bin}` found at {} but is not executable (try `chmod +x`)",
+                        found.display()
+                    ),
+                )
+            }
+        }
+        None if path_env.is_none() => DoctorCheck::warn(
+            "command.binary",
+            format!("PATH not set in this process; cannot verify `{bin}`"),
+        ),
+        None => DoctorCheck::fail("command.binary", format!("`{bin}` not found on PATH")),
+    }
+}
+
+/// Probe a directory for read+write usability. Tries to create it if missing
+/// and writes (then removes) a tiny sentinel file. `Ok` means writable today;
+/// `Fail` means the harness will explode the first time it tries to persist a
+/// run or session there.
+pub async fn check_writable_dir(name: &str, dir: &Path) -> DoctorCheck {
+    if let Err(err) = fs::create_dir_all(dir).await {
+        return DoctorCheck::fail(name, format!("cannot create {}: {err}", dir.display()));
+    }
+    let probe = dir.join(".forge-doctor-probe");
+    match fs::write(&probe, b"ok").await {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe).await;
+            DoctorCheck::ok(name, format!("{} is writable", dir.display()))
+        }
+        Err(err) => DoctorCheck::fail(name, format!("cannot write to {}: {err}", dir.display())),
+    }
+}
+
+/// Check that every active skill name still resolves to a discovered skill.
+/// Pure given the `discovered` list — the impure discovery is the caller's
+/// problem so this stays testable without touching the filesystem.
+pub fn check_active_skills(active: &[String], discovered: &[Skill]) -> Vec<DoctorCheck> {
+    if active.is_empty() {
+        return vec![DoctorCheck::ok("skills.active", "no active skills")];
+    }
+    let known: std::collections::HashSet<&str> =
+        discovered.iter().map(|s| s.name.as_str()).collect();
+    let mut out = Vec::new();
+    for name in active {
+        if known.contains(name.as_str()) {
+            out.push(DoctorCheck::ok(
+                "skills.active",
+                format!("`{name}` is discoverable"),
+            ));
+        } else {
+            out.push(DoctorCheck::fail(
+                "skills.active",
+                format!("`{name}` no longer found on the skill search path"),
+            ));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Failure feedback. Pure helper that turns a non-succeeding [`RunRecord`] into
+// a short, actionable block of transcript lines: run id, exit code, log
+// paths, and a hint at /open-run, /logs, /retry. Both UIs format this the
+// same way so the user sees consistent output whether they ran the TUI or the
+// plain REPL.
+// ---------------------------------------------------------------------------
+
+/// Build a short list of lines describing how the run failed and where to
+/// look. Returns an empty Vec for successful runs (callers should skip the
+/// block in that case). Cancelled runs get a one-line summary; failed and
+/// timed-out runs get the full breakdown.
+pub fn format_failure_guidance(record: &RunRecord) -> Vec<String> {
+    let id_prefix: String = record.id.chars().take(8).collect();
+    match record.status {
+        RunStatus::Succeeded => Vec::new(),
+        RunStatus::Cancelled => vec![format!(
+            "run {id_prefix} cancelled; logs: {} / {}",
+            record.stdout_log.display(),
+            record.stderr_log.display(),
+        )],
+        RunStatus::Failed | RunStatus::TimedOut => {
+            let label = match record.status {
+                RunStatus::TimedOut => "timed out",
+                _ => "failed",
+            };
+            let exit = match record.exit_code {
+                Some(code) => code.to_string(),
+                None => "(none)".to_string(),
+            };
+            vec![
+                format!(
+                    "run {id_prefix} {label} (exit {exit}, {}ms)",
+                    record.duration_ms
+                ),
+                format!("stdout: {}", record.stdout_log.display()),
+                format!("stderr: {}", record.stderr_log.display()),
+                format!("hint: /open-run {id_prefix}   /logs {id_prefix}   /retry {id_prefix}"),
+            ]
+        }
+    }
+}
+
+/// Count the (ok, warn, fail) results in a doctor report. Useful for status
+/// summaries.
+pub fn doctor_counts(checks: &[DoctorCheck]) -> (usize, usize, usize) {
+    let mut counts = (0, 0, 0);
+    for check in checks {
+        match check.level {
+            DoctorLevel::Ok => counts.0 += 1,
+            DoctorLevel::Warn => counts.1 += 1,
+            DoctorLevel::Fail => counts.2 += 1,
+        }
+    }
+    counts
+}
+
+/// Top-level doctor runner. Performs all checks and returns them in display
+/// order. Impure: touches the filesystem and reads PATH from the environment.
+pub async fn run_doctor(
+    config: &HarnessConfig,
+    session: &Session,
+    runs_dir: &Path,
+    sessions_dir: &Path,
+) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+
+    let profile_check = check_profile(config, &session.profile);
+    let profile_fatal = profile_check.level == DoctorLevel::Fail;
+    checks.push(profile_check);
+    if !profile_fatal && let Some(profile) = config.profiles.get(&session.profile) {
+        let path_env = std::env::var("PATH").ok();
+        checks.push(check_command_binary(profile, path_env.as_deref()));
+    }
+
+    checks.push(if session.cwd.is_dir() {
+        DoctorCheck::ok("cwd", format!("{} exists", session.cwd.display()))
+    } else {
+        DoctorCheck::fail(
+            "cwd",
+            format!("session cwd {} does not exist", session.cwd.display()),
+        )
+    });
+
+    checks.push(check_writable_dir("runs_dir", runs_dir).await);
+    checks.push(check_writable_dir("sessions_dir", sessions_dir).await);
+
+    match discover_skills(&session.cwd).await {
+        Ok(skills) => {
+            checks.push(DoctorCheck::ok(
+                "skills.discovery",
+                format!("found {} skill(s)", skills.len()),
+            ));
+            checks.extend(check_active_skills(&session.active_skills, &skills));
+        }
+        Err(err) => {
+            checks.push(DoctorCheck::warn(
+                "skills.discovery",
+                format!("skill discovery failed: {err:#}"),
+            ));
+        }
+    }
+
+    checks.push(match &session.provider_session_id {
+        Some(id) => DoctorCheck::ok("provider.session_id", format!("set: {id}")),
+        None => DoctorCheck::ok("provider.session_id", "not set".to_string()),
+    });
+
+    checks
 }
 
 #[cfg(test)]
@@ -1210,6 +1679,7 @@ mod tests {
                 provider_session_id: None,
             },
             tx,
+            None,
         )
         .await?;
 
@@ -1506,5 +1976,548 @@ mod tests {
 
         assert_eq!(record.status, RunStatus::TimedOut);
         Ok(())
+    }
+
+    /// Drive the graceful-cancel path end-to-end: spawn a long sleep, fire
+    /// the cancel signal, and assert the run completes promptly with
+    /// `RunStatus::Cancelled`. The whole cycle must finish well inside the
+    /// would-be sleep duration; if SIGTERM/SIGKILL isn't being plumbed the
+    /// test would block for ~30s and trip the harness timeout instead.
+    #[tokio::test]
+    async fn graceful_cancel_terminates_child_promptly() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config = HarnessConfig {
+            profiles: BTreeMap::from([(
+                "default".to_string(),
+                AgentProfile {
+                    command: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        // `exec` replaces the shell so SIGTERM lands on
+                        // `sleep` directly. Without `exec`, sh would fork
+                        // sleep as a child and SIGTERM to sh would orphan
+                        // the sleep, leaving stdout/stderr pipes open and
+                        // wedging the streaming reader.
+                        "exec sleep 30".to_string(),
+                    ],
+                    bypass_args: Vec::new(),
+                    desktop_args: Vec::new(),
+                    desktop_prompt_prefix: None,
+                    env: BTreeMap::new(),
+                    cwd: None,
+                    timeout_secs: Some(60),
+                    prompt_arg: false,
+                    continue_args: Vec::new(),
+                    session_id_capture_prefix: None,
+                },
+            )]),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let runs_dir = temp.path().to_path_buf();
+        let join = tokio::spawn(async move {
+            run_agent_streaming(
+                &config,
+                &runs_dir,
+                RunRequest {
+                    profile: "default".to_string(),
+                    prompt: "ignored".to_string(),
+                    label: None,
+                    cwd: None,
+                    timeout_secs: None,
+                    bypass_permissions: false,
+                    desktop_control: false,
+                    prompt_prefix: None,
+                    provider_session_id: None,
+                },
+                tx,
+                Some(cancel_rx),
+            )
+            .await
+        });
+
+        // Wait briefly so the child is actually running before we cancel.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_tx.send(()).expect("receiver still alive");
+
+        // The whole cancel cycle (SIGTERM + ~200ms grace + write record)
+        // should complete well under 2s — sleep(30) would obviously not.
+        let record = tokio::time::timeout(Duration::from_secs(2), join)
+            .await
+            .context("graceful cancel did not complete within 2s")???;
+
+        assert_eq!(record.status, RunStatus::Cancelled);
+        assert_eq!(record.exit_code, None);
+        Ok(())
+    }
+
+    /// Exercise the SIGKILL fallback: a child that traps SIGTERM and keeps
+    /// running. `finish_cancel` must fall through the grace window and
+    /// escalate to `Child::kill` so the test still completes promptly.
+    ///
+    /// Uses Python rather than a shell because we need the *spawned* PID to
+    /// be the one ignoring SIGTERM; `sh -c "trap ... ; sleep N"` forks
+    /// `sleep` as a child, and signals to sh leave `sleep` holding the
+    /// pipes open even after sh exits. Skipped if python3 is absent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_cancel_escalates_to_sigkill_when_child_ignores_sigterm() -> Result<()> {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("python3 not available; skipping SIGKILL fallback test");
+            return Ok(());
+        }
+        let temp = TempDir::new()?;
+        let config = HarnessConfig {
+            profiles: BTreeMap::from([(
+                "default".to_string(),
+                AgentProfile {
+                    command: vec![
+                        "python3".to_string(),
+                        "-c".to_string(),
+                        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)".to_string(),
+                    ],
+                    bypass_args: Vec::new(),
+                    desktop_args: Vec::new(),
+                    desktop_prompt_prefix: None,
+                    env: BTreeMap::new(),
+                    cwd: None,
+                    timeout_secs: Some(60),
+                    prompt_arg: false,
+                    continue_args: Vec::new(),
+                    session_id_capture_prefix: None,
+                },
+            )]),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let runs_dir = temp.path().to_path_buf();
+        let join = tokio::spawn(async move {
+            run_agent_streaming(
+                &config,
+                &runs_dir,
+                RunRequest {
+                    profile: "default".to_string(),
+                    prompt: "ignored".to_string(),
+                    label: None,
+                    cwd: None,
+                    timeout_secs: None,
+                    bypass_permissions: false,
+                    desktop_control: false,
+                    prompt_prefix: None,
+                    provider_session_id: None,
+                },
+                tx,
+                Some(cancel_rx),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_tx.send(()).expect("receiver still alive");
+
+        // Grace is 200ms; SIGKILL after that. Allow plenty of headroom for
+        // slow CI but well under sleep 30.
+        let record = tokio::time::timeout(Duration::from_secs(3), join)
+            .await
+            .context("SIGKILL fallback did not complete within 3s")???;
+
+        assert_eq!(record.status, RunStatus::Cancelled);
+        Ok(())
+    }
+
+    /// Regression for the process-group cancel fix: a shell wrapper that
+    /// fork()s a long-running grandchild (the common shape of a "real-agent
+    /// runs under sh -c" profile). Without the process_group(0) + signal
+    /// to -pgid, SIGTERM to the immediate child kills the shell but leaves
+    /// the grandchild alive holding the stdout/stderr pipes — `stream_pipe`
+    /// then blocks forever waiting for EOF.
+    ///
+    /// The test wedges on the old behavior (timing out at 3s) and completes
+    /// in <300ms with the fix.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_cancel_reaps_shell_wrapper_grandchildren() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config = HarnessConfig {
+            profiles: BTreeMap::from([(
+                "default".to_string(),
+                AgentProfile {
+                    command: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        // sh fork()s `sleep 30` into the background and
+                        // then `wait`s. Both processes live in the same
+                        // process group as sh (and now, thanks to
+                        // process_group(0), the same group `finish_cancel`
+                        // signals via kill(-pgid)).
+                        "sleep 30 & wait".to_string(),
+                    ],
+                    bypass_args: Vec::new(),
+                    desktop_args: Vec::new(),
+                    desktop_prompt_prefix: None,
+                    env: BTreeMap::new(),
+                    cwd: None,
+                    timeout_secs: Some(60),
+                    prompt_arg: false,
+                    continue_args: Vec::new(),
+                    session_id_capture_prefix: None,
+                },
+            )]),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let runs_dir = temp.path().to_path_buf();
+        let join = tokio::spawn(async move {
+            run_agent_streaming(
+                &config,
+                &runs_dir,
+                RunRequest {
+                    profile: "default".to_string(),
+                    prompt: "ignored".to_string(),
+                    label: None,
+                    cwd: None,
+                    timeout_secs: None,
+                    bypass_permissions: false,
+                    desktop_control: false,
+                    prompt_prefix: None,
+                    provider_session_id: None,
+                },
+                tx,
+                Some(cancel_rx),
+            )
+            .await
+        });
+
+        // Give sh time to fork the grandchild before we cancel.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel_tx.send(()).expect("receiver still alive");
+
+        // If the process-group fix regresses, this times out at 3s because
+        // `stream_pipe` blocks on the orphaned grandchild's pipe.
+        let record = tokio::time::timeout(Duration::from_secs(3), join)
+            .await
+            .context(
+                "process-group cancel did not complete within 3s — likely a regression \
+                 of the shell-wrapper grandchild reap",
+            )???;
+
+        assert_eq!(record.status, RunStatus::Cancelled);
+        Ok(())
+    }
+
+    // ---- /doctor helpers -----------------------------------------------
+
+    fn cfg_with(profiles: &[(&str, Vec<&str>)]) -> HarnessConfig {
+        HarnessConfig {
+            profiles: profiles
+                .iter()
+                .map(|(name, cmd)| {
+                    (
+                        (*name).to_string(),
+                        AgentProfile {
+                            command: cmd.iter().map(|s| (*s).to_string()).collect(),
+                            bypass_args: Vec::new(),
+                            desktop_args: Vec::new(),
+                            desktop_prompt_prefix: None,
+                            env: BTreeMap::new(),
+                            cwd: None,
+                            timeout_secs: None,
+                            prompt_arg: true,
+                            continue_args: Vec::new(),
+                            session_id_capture_prefix: None,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn check_profile_ok_when_profile_exists_with_command() {
+        let config = cfg_with(&[("default", vec!["echo", "hi"])]);
+        let result = check_profile(&config, "default");
+        assert_eq!(result.level, DoctorLevel::Ok);
+        assert!(result.detail.contains("echo hi"));
+    }
+
+    #[test]
+    fn check_profile_fails_when_profile_missing_and_lists_available() {
+        let config = cfg_with(&[("alpha", vec!["true"]), ("beta", vec!["true"])]);
+        let result = check_profile(&config, "missing");
+        assert_eq!(result.level, DoctorLevel::Fail);
+        assert!(result.detail.contains("alpha"));
+        assert!(result.detail.contains("beta"));
+    }
+
+    #[test]
+    fn check_profile_fails_when_command_is_empty() {
+        let config = cfg_with(&[("default", vec![])]);
+        let result = check_profile(&config, "default");
+        assert_eq!(result.level, DoctorLevel::Fail);
+        assert_eq!(result.name, "profile.command");
+    }
+
+    #[test]
+    fn find_on_path_locates_existing_file() {
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("forge-doctor-fixture");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let path_env = temp.path().display().to_string();
+        let found = find_on_path(&path_env, "forge-doctor-fixture");
+        assert_eq!(found.as_deref(), Some(bin.as_path()));
+    }
+
+    #[test]
+    fn find_on_path_returns_none_for_missing_name() {
+        let temp = TempDir::new().unwrap();
+        let path_env = temp.path().display().to_string();
+        assert!(find_on_path(&path_env, "definitely-not-here-xyz").is_none());
+    }
+
+    #[test]
+    fn check_command_binary_warns_for_relative_path() {
+        let profile = AgentProfile {
+            command: vec!["./scripts/run.sh".to_string()],
+            bypass_args: Vec::new(),
+            desktop_args: Vec::new(),
+            desktop_prompt_prefix: None,
+            env: BTreeMap::new(),
+            cwd: None,
+            timeout_secs: None,
+            prompt_arg: true,
+            continue_args: Vec::new(),
+            session_id_capture_prefix: None,
+        };
+        let result = check_command_binary(&profile, Some("/usr/bin:/bin"));
+        assert_eq!(result.level, DoctorLevel::Warn);
+    }
+
+    #[test]
+    fn check_command_binary_fails_for_missing_absolute_path() {
+        let profile = AgentProfile {
+            command: vec!["/no/such/binary-xyz".to_string()],
+            bypass_args: Vec::new(),
+            desktop_args: Vec::new(),
+            desktop_prompt_prefix: None,
+            env: BTreeMap::new(),
+            cwd: None,
+            timeout_secs: None,
+            prompt_arg: true,
+            continue_args: Vec::new(),
+            session_id_capture_prefix: None,
+        };
+        let result = check_command_binary(&profile, None);
+        assert_eq!(result.level, DoctorLevel::Fail);
+    }
+
+    /// Build an `AgentProfile` whose command is a single bare name. Keeps
+    /// the exec-bit tests below readable.
+    fn bare_profile(name: &str) -> AgentProfile {
+        AgentProfile {
+            command: vec![name.to_string()],
+            bypass_args: Vec::new(),
+            desktop_args: Vec::new(),
+            desktop_prompt_prefix: None,
+            env: BTreeMap::new(),
+            cwd: None,
+            timeout_secs: None,
+            prompt_arg: true,
+            continue_args: Vec::new(),
+            session_id_capture_prefix: None,
+        }
+    }
+
+    /// On Unix, set the file's mode. No-op elsewhere.
+    fn set_mode(_path: &Path, _mode: u32) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(_path).unwrap().permissions();
+            perms.set_mode(_mode);
+            std::fs::set_permissions(_path, perms).unwrap();
+        }
+    }
+
+    #[test]
+    fn check_command_binary_ok_for_bare_name_on_path_when_executable() {
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("forge-doctor-bare");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        set_mode(&bin, 0o755);
+        let result = check_command_binary(
+            &bare_profile("forge-doctor-bare"),
+            Some(&temp.path().display().to_string()),
+        );
+        assert_eq!(result.level, DoctorLevel::Ok);
+    }
+
+    /// PATH search lands on the file but the user forgot `chmod +x`. We
+    /// should surface this as a FAIL so the diagnosis lands at `/doctor`
+    /// time rather than as "Permission denied" mid-run. Unix-only because
+    /// the exec bit is a Unix concept.
+    #[cfg(unix)]
+    #[test]
+    fn check_command_binary_fails_when_path_match_is_not_executable() {
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("forge-doctor-no-x");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        set_mode(&bin, 0o644);
+        let result = check_command_binary(
+            &bare_profile("forge-doctor-no-x"),
+            Some(&temp.path().display().to_string()),
+        );
+        assert_eq!(result.level, DoctorLevel::Fail);
+        assert!(
+            result.detail.contains("not executable"),
+            "expected exec-bit detail, got: {}",
+            result.detail
+        );
+    }
+
+    /// Same story for an absolute-path command.
+    #[cfg(unix)]
+    #[test]
+    fn check_command_binary_fails_when_absolute_path_is_not_executable() {
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("agent.sh");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        set_mode(&bin, 0o644);
+        let profile = bare_profile(bin.to_str().unwrap());
+        let result = check_command_binary(&profile, None);
+        assert_eq!(result.level, DoctorLevel::Fail);
+        assert!(result.detail.contains("not executable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_command_binary_ok_when_absolute_path_is_executable() {
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("agent.sh");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        set_mode(&bin, 0o755);
+        let profile = bare_profile(bin.to_str().unwrap());
+        let result = check_command_binary(&profile, None);
+        assert_eq!(result.level, DoctorLevel::Ok);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_executable_file_reflects_unix_x_bits() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("sample");
+        std::fs::write(&path, b"x").unwrap();
+        set_mode(&path, 0o644);
+        assert!(!is_executable_file(&path));
+        set_mode(&path, 0o755);
+        assert!(is_executable_file(&path));
+        // A directory is not a file, regardless of mode.
+        assert!(!is_executable_file(temp.path()));
+    }
+
+    #[tokio::test]
+    async fn check_writable_dir_creates_missing_subdir() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("nested/dir");
+        let result = check_writable_dir("runs_dir", &target).await;
+        assert_eq!(result.level, DoctorLevel::Ok);
+        assert!(target.is_dir());
+        // Probe file should be cleaned up.
+        assert!(!target.join(".forge-doctor-probe").exists());
+    }
+
+    #[test]
+    fn check_active_skills_ok_when_empty() {
+        let result = check_active_skills(&[], &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].level, DoctorLevel::Ok);
+    }
+
+    #[test]
+    fn check_active_skills_fails_for_missing_skills() {
+        let discovered = vec![Skill {
+            name: "writing".to_string(),
+            path: PathBuf::from("/dev/null"),
+            title: None,
+            description: None,
+            triggers: vec![],
+            body: String::new(),
+        }];
+        let active = vec!["writing".to_string(), "ghost".to_string()];
+        let results = check_active_skills(&active, &discovered);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].level, DoctorLevel::Ok);
+        assert_eq!(results[1].level, DoctorLevel::Fail);
+        assert!(results[1].detail.contains("ghost"));
+    }
+
+    #[test]
+    fn doctor_check_format_line_includes_level_name_and_detail() {
+        let check = DoctorCheck::warn("foo", "bar");
+        assert_eq!(check.format_line(), "[WARN] foo: bar");
+    }
+
+    // ---- format_failure_guidance --------------------------------------
+
+    fn record_with(status: RunStatus, exit: Option<i32>) -> RunRecord {
+        RunRecord {
+            id: "abcdef1234567890".to_string(),
+            profile: "default".to_string(),
+            label: None,
+            prompt: "p".to_string(),
+            command: vec!["true".to_string()],
+            cwd: PathBuf::from("/tmp"),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            duration_ms: 123,
+            timeout_secs: None,
+            status,
+            exit_code: exit,
+            stdout_log: PathBuf::from("/tmp/runs/run/stdout.log"),
+            stderr_log: PathBuf::from("/tmp/runs/run/stderr.log"),
+            captured_session_id: None,
+        }
+    }
+
+    #[test]
+    fn format_failure_guidance_empty_for_success() {
+        let lines = format_failure_guidance(&record_with(RunStatus::Succeeded, Some(0)));
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn format_failure_guidance_for_failed_run_includes_id_exit_logs_and_hint() {
+        let lines = format_failure_guidance(&record_with(RunStatus::Failed, Some(1)));
+        assert_eq!(lines.len(), 4);
+        let first = &lines[0];
+        assert!(first.contains("abcdef12"));
+        assert!(first.contains("failed"));
+        assert!(first.contains("exit 1"));
+        assert!(first.contains("123ms"));
+        assert!(lines[1].contains("stdout.log"));
+        assert!(lines[2].contains("stderr.log"));
+        let hint = &lines[3];
+        assert!(hint.contains("/open-run abcdef12"));
+        assert!(hint.contains("/logs abcdef12"));
+        assert!(hint.contains("/retry abcdef12"));
+    }
+
+    #[test]
+    fn format_failure_guidance_for_timeout_uses_timed_out_label() {
+        let lines = format_failure_guidance(&record_with(RunStatus::TimedOut, None));
+        assert!(lines[0].contains("timed out"));
+        assert!(lines[0].contains("exit (none)"));
+    }
+
+    #[test]
+    fn format_failure_guidance_for_cancelled_is_one_line_with_logs() {
+        let lines = format_failure_guidance(&record_with(RunStatus::Cancelled, None));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("cancelled"));
+        assert!(lines[0].contains("stdout.log"));
+        assert!(lines[0].contains("stderr.log"));
     }
 }

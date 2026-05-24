@@ -23,12 +23,15 @@ use forge_cli::SessionTurn;
 use forge_cli::Skill;
 use forge_cli::create_skill;
 use forge_cli::discover_skills;
+use forge_cli::doctor_counts;
 use forge_cli::find_run;
+use forge_cli::format_failure_guidance;
 use forge_cli::list_runs;
 use forge_cli::list_sessions;
 use forge_cli::load_session;
 use forge_cli::read_transcript;
 use forge_cli::run_agent_streaming;
+use forge_cli::run_doctor;
 use forge_cli::save_session;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -251,6 +254,16 @@ struct ActiveRun {
     /// Concatenated stdout lines, separated by `\n`, captured so the final
     /// assistant turn can be persisted to the session transcript.
     assistant_buffer: String,
+    /// Fires graceful shutdown inside `run_agent_streaming`. Taken (and sent
+    /// through) by `cancel_active_run`. `None` after the first send because
+    /// `oneshot::Sender::send` consumes the sender; future cancel attempts
+    /// fall back to a hard abort.
+    cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// True once the user has fired the cancel signal. `pump_active_run`
+    /// reads this to render the final record as a cancellation rather than a
+    /// generic failure, and to suppress the "(no output)" / "exit code"
+    /// follow-up lines.
+    cancel_requested: bool,
 }
 
 enum Action {
@@ -372,6 +385,10 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
             }),
         ),
     ]));
+    // Header is one line of single-style spans. Today nothing risks leaving
+    // stale cells (every frame redraws the full line), but a future change
+    // could shorten one of the spans — Clear keeps the invariant cheap.
+    frame.render_widget(Clear, chunks[0]);
     frame.render_widget(header, chunks[0]);
 
     let body = state
@@ -391,12 +408,20 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     frame.render_widget(transcript, transcript_area);
 
     if suggestions_height > 0 {
+        // The suggestions panel can render fewer lines than the area's height
+        // (e.g. as the user types and the fuzzy list shrinks). Without an
+        // explicit Clear, ratatui's diffing leaves stale rows from the
+        // previous frame visible.
+        frame.render_widget(Clear, chunks[2]);
         render_suggestions(frame, chunks[2], &suggestions, state.selected_suggestion);
     }
 
     if details_height > 0
         && let Some(cmd) = selected_command
     {
+        // Same risk as the suggestions panel: the details Paragraph wraps and
+        // may not fill the whole rect, so clear first.
+        frame.render_widget(Clear, chunks[3]);
         render_command_details(frame, chunks[3], cmd);
     }
 
@@ -415,6 +440,11 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         .style(Style::default().fg(Color::White))
         .scroll((input_scroll as u16, 0))
         .block(composer_block);
+    // The composer block draws its own border every frame, but the inner
+    // paragraph may not fill every row when the user deletes text. Clearing
+    // first avoids leftover glyphs from a longer prior frame (the same risk
+    // the suggestions/details panes guard against).
+    frame.render_widget(Clear, chunks[4]);
     frame.render_widget(input, chunks[4]);
     set_input_cursor(
         frame,
@@ -673,14 +703,74 @@ fn transcript_scroll(state: &TuiState, height: u16, body_len: usize) -> u16 {
     state.scroll.min(max_scroll)
 }
 
+/// Severity bucket for a status-bar message. Used to pick the right style
+/// without coupling the renderer to a list of substrings. Keep in sync with
+/// the prefix table in [`classify_status_message`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusSeverity {
+    /// Quiet baseline: empty string, neutral hints. Rendered as Success.
+    Info,
+    /// A run is in flight. Rendered yellow so the user sees activity.
+    Running,
+    /// A successful action — green.
+    Success,
+    /// A user-facing warning that isn't a hard error (currently unused at
+    /// callsites, but kept distinct so future tweaks don't need a refactor).
+    #[allow(dead_code)]
+    Warning,
+    /// A failure or rejected operation — red.
+    Error,
+}
+
+/// Classify a status-bar message by its leading token(s). Pure and tested.
+///
+/// Prefix-based (not substring-based) on purpose: a benign message that happens
+/// to contain the literal "Unknown" or "Failed" anywhere in its body should
+/// not flip the bar red. See the `status_severity_*` tests for the contract.
+pub(crate) fn classify_status_message(status: &str) -> StatusSeverity {
+    let trimmed = status.trim();
+    if trimmed.is_empty() {
+        return StatusSeverity::Info;
+    }
+    if trimmed.starts_with("Running") || trimmed.starts_with("Cancelling") {
+        return StatusSeverity::Running;
+    }
+    // Explicit error prefixes. Anything starting with one of these is treated
+    // as an error; everything else falls through to Success.
+    //
+    // The trailing space on "Unknown " is what protects a hypothetical benign
+    // status like "Unknownability score: 7" from being painted red — it has to
+    // look like "Unknown <thing>".
+    const ERROR_PREFIXES: &[&str] = &[
+        "Failed",
+        "TimedOut",
+        "Refusing ",
+        "Run denied",
+        "Usage:",
+        "Unknown ",
+        "Unknown:",
+        "Unknown,",
+    ];
+    for prefix in ERROR_PREFIXES {
+        if trimmed.starts_with(prefix) {
+            return StatusSeverity::Error;
+        }
+    }
+    if trimmed == "Unknown" {
+        return StatusSeverity::Error;
+    }
+    StatusSeverity::Success
+}
+
 fn status_style(status: &str) -> Style {
-    if status.contains("Running") {
-        Style::default().fg(Color::Yellow)
-    } else if status.contains("Failed") || status.contains("TimedOut") || status.contains("Unknown")
-    {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(Color::Green)
+    style_for_severity(classify_status_message(status))
+}
+
+fn style_for_severity(severity: StatusSeverity) -> Style {
+    match severity {
+        StatusSeverity::Running => Style::default().fg(Color::Yellow),
+        StatusSeverity::Error | StatusSeverity::Warning => Style::default().fg(Color::Red),
+        StatusSeverity::Success | StatusSeverity::Info => Style::default().fg(Color::Green),
     }
 }
 
@@ -1335,28 +1425,60 @@ fn approve_pending(state: &mut TuiState, persist_bypass: bool) {
     state.pending_action = Some(Action::Submit(approval.prompt));
 }
 
-/// Abort the in-flight run, if any, and surface a `Run cancelled` line. Returns
-/// `true` when a run was actually cancelled; the Esc handler uses that to
-/// decide whether to suppress the default "exit TUI" behavior.
+/// Request cancellation of the in-flight run, if any, and surface a
+/// `Run cancelled` line. Returns `true` when a run was actually cancelled;
+/// the Esc handler uses that to decide whether to suppress the default
+/// "exit TUI" behavior.
+///
+/// Graceful cancellation strategy:
+///   1. Fire the oneshot signal threaded into `run_agent_streaming`. The lib
+///      side responds by sending SIGTERM, waiting `GRACEFUL_CANCEL_GRACE`
+///      (~200ms), then SIGKILL via `Child::kill`.
+///   2. The ActiveRun slot is *kept* (with `cancel_requested = true`) so the
+///      TUI poll loop can render the final cancelled record naturally. A
+///      hard `handle.abort()` would race the SIGTERM and rob the child of its
+///      flush window.
+///   3. A subsequent Esc press finds `cancel_requested = true` and escalates
+///      to a hard abort, draining the slot.
 fn cancel_active_run(
     active_run: &mut Option<ActiveRun>,
     transcript: &mut Vec<TranscriptEntry>,
     status: &mut String,
 ) -> bool {
-    let Some(active) = active_run.take() else {
+    let Some(active) = active_run.as_mut() else {
         return false;
     };
-    // Abort drops the future, which drops the kill_on_drop child handle and
-    // reaps the agent process. We don't await the JoinHandle here — the TUI
-    // loop returns immediately so the user sees the cancel land.
-    active.handle.abort();
+    if active.cancel_requested {
+        // Second cancel press: fall back to a hard abort. drop on the
+        // kill_on_drop child sends SIGKILL.
+        let active = active_run.take().expect("checked above");
+        active.handle.abort();
+        let suffix = if active.assistant_open || active.error_open {
+            " (partial output preserved above)"
+        } else {
+            ""
+        };
+        transcript.push(TranscriptEntry::system(format!(
+            "Run cancelled (hard abort){suffix}"
+        )));
+        *status = "Run cancelled".to_string();
+        return true;
+    }
+
+    active.cancel_requested = true;
+    // Take the sender so the lib-side select! fires SIGTERM. A dropped sender
+    // (`send` returning Err) means the task already finished — harmless.
+    if let Some(tx) = active.cancel_tx.take() {
+        let _ = tx.send(());
+    }
+
     let suffix = if active.assistant_open || active.error_open {
         " (partial output preserved above)"
     } else {
         ""
     };
     transcript.push(TranscriptEntry::system(format!("Run cancelled{suffix}")));
-    *status = "Run cancelled".to_string();
+    *status = "Cancelling…".to_string();
     true
 }
 
@@ -1380,8 +1502,10 @@ fn start_run(state: &mut TuiState, prompt: String) {
     };
     let config = state.config.clone();
     let runs_dir = state.runs_dir.clone();
-    let handle =
-        tokio::spawn(async move { run_agent_streaming(&config, &runs_dir, request, tx).await });
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        run_agent_streaming(&config, &runs_dir, request, tx, Some(cancel_rx)).await
+    });
 
     state.active_run = Some(ActiveRun {
         handle,
@@ -1390,6 +1514,8 @@ fn start_run(state: &mut TuiState, prompt: String) {
         assistant_open: false,
         error_open: false,
         assistant_buffer: String::new(),
+        cancel_tx: Some(cancel_tx),
+        cancel_requested: false,
     });
 }
 
@@ -1417,17 +1543,22 @@ async fn pump_active_run(state: &mut TuiState) {
             Ok(Ok(record)) => {
                 state.last_run_id = Some(record.id.clone());
                 state.status = format!("{:?} in {}ms", record.status, record.duration_ms);
-                if !active.assistant_open && !active.error_open {
+                // For a cancelled run the `Run cancelled` transcript line was
+                // already pushed by `cancel_active_run` synchronously when
+                // the user pressed Esc — don't pile on a generic
+                // "(no output)" or "exit code: None" line afterwards.
+                let suppress_followups =
+                    active.cancel_requested || record.status == RunStatus::Cancelled;
+                if !active.assistant_open && !active.error_open && !suppress_followups {
                     state.push_entries([TranscriptEntry::system(format!(
                         "(no output) exit={:?}",
                         record.exit_code
                     ))]);
                 }
-                if record.status != RunStatus::Succeeded && !active.error_open {
-                    state.push_entries([TranscriptEntry::error(format!(
-                        "exit code: {:?}",
-                        record.exit_code
-                    ))]);
+                if record.status != RunStatus::Succeeded && !suppress_followups {
+                    for line in format_failure_guidance(&record) {
+                        state.push_entries([TranscriptEntry::error(line)]);
+                    }
                 }
                 if let Some(provider_id) = record.captured_session_id.clone()
                     && state.session.provider_session_id.as_ref() != Some(&provider_id)
@@ -1449,7 +1580,10 @@ async fn pump_active_run(state: &mut TuiState) {
                 state.push_entries([TranscriptEntry::error(format!("{err:#}"))]);
             }
             Err(join_err) => {
-                state.status = format!("Run task panicked: {join_err}");
+                // Prefix with "Failed" so status_style picks the red palette
+                // (otherwise this falls through to the green default and a
+                // panicked task looks like a successful run).
+                state.status = format!("Failed: run task panicked: {join_err}");
             }
         }
     }
@@ -1510,6 +1644,44 @@ fn apply_run_event(state: &mut TuiState, event: RunEvent) {
         }
     }
 }
+
+/// Every command name (canonical, not aliases) that `handle_command` below
+/// dispatches. Kept as a separate constant so the registry parity test in
+/// `commands.rs` can fail loudly when a new entry is added to
+/// `commands::COMMANDS` without also being wired into TUI dispatch. Keep this
+/// list in sync with the `match` arms below.
+#[allow(dead_code)]
+pub(crate) const TUI_DISPATCHED_COMMANDS: &[&str] = &[
+    "exit",
+    "help",
+    "skills",
+    "skill",
+    "bypass",
+    "desktop",
+    "clear",
+    "profile",
+    "profiles",
+    "runs",
+    "last",
+    "cancel",
+    "retry",
+    "new",
+    "sessions",
+    "resume",
+    "fork",
+    "status",
+    "model",
+    "permissions",
+    "compact",
+    "smoke",
+    "inspect",
+    "open-run",
+    "logs",
+    "export",
+    "provider",
+    "jobs",
+    "doctor",
+];
 
 async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
     let mut parts = command.split_whitespace();
@@ -1870,6 +2042,27 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
                 TranscriptEntry::system(format!("profile: {}", state.session.profile)),
                 TranscriptEntry::system(format!("command: {}", profile.command.join(" "))),
             ]);
+            Ok(false)
+        }
+        "doctor" => {
+            let checks = run_doctor(
+                &state.config,
+                &state.session,
+                &state.runs_dir,
+                &state.sessions_dir,
+            )
+            .await;
+            let (oks, warns, fails) = doctor_counts(&checks);
+            state.push_system("forge /doctor:".to_string());
+            for check in &checks {
+                let line = check.format_line();
+                state.push_entries([match check.level {
+                    forge_cli::DoctorLevel::Ok => TranscriptEntry::system(line),
+                    forge_cli::DoctorLevel::Warn => TranscriptEntry::system(line),
+                    forge_cli::DoctorLevel::Fail => TranscriptEntry::error(line),
+                }]);
+            }
+            state.status = format!("doctor: {oks} OK, {warns} WARN, {fails} FAIL");
             Ok(false)
         }
         "permissions" => {
@@ -2254,6 +2447,119 @@ mod tests {
     }
 
     #[test]
+    fn status_severity_classifies_running() {
+        assert_eq!(classify_status_message("Running…"), StatusSeverity::Running);
+        assert_eq!(
+            classify_status_message("Running (abc12345)"),
+            StatusSeverity::Running
+        );
+    }
+
+    #[test]
+    fn status_severity_classifies_explicit_errors() {
+        for s in [
+            "Failed",
+            "Failed in 123ms",
+            "Failed: spawn error",
+            "Failed: run task panicked: explicit panic",
+            "TimedOut in 60000ms",
+            "Unknown profile `foo`",
+            "Unknown skill `bar`",
+            "Unknown command: /xyz",
+            "Unknown",
+            "Refusing to overwrite /tmp/foo",
+            "Run denied; edit and resubmit",
+            "Usage: /open-run <id>",
+        ] {
+            assert_eq!(
+                classify_status_message(s),
+                StatusSeverity::Error,
+                "expected Error for `{s}`"
+            );
+        }
+    }
+
+    #[test]
+    fn status_severity_does_not_match_substring_unknown() {
+        // The whole point of moving from substring-matching to prefix-matching:
+        // a benign message that mentions the literal "Unknown" mid-string must
+        // stay Success, not flip red.
+        assert_eq!(
+            classify_status_message("Loaded 3 items (1 Unknown skipped)"),
+            StatusSeverity::Success
+        );
+        assert_eq!(
+            classify_status_message("ack: 1 Unknown profile reference"),
+            StatusSeverity::Success
+        );
+    }
+
+    #[test]
+    fn status_severity_does_not_match_substring_failed() {
+        // Same brittleness story as Unknown.
+        assert_eq!(
+            classify_status_message("Reloaded skill `Failed-Login-Notes`"),
+            StatusSeverity::Success
+        );
+    }
+
+    #[test]
+    fn status_severity_defaults_to_success_for_typical_idle_messages() {
+        for s in [
+            "ready",
+            "Cleared transcript",
+            "Succeeded in 42ms",
+            "Skills cleared",
+            "Profile switched to default",
+            "permissions: bypass",
+            "Resumed abc123",
+            "compacted: dropped 5 turn(s)",
+            "Exported to /tmp/session.md",
+        ] {
+            assert_eq!(
+                classify_status_message(s),
+                StatusSeverity::Success,
+                "expected Success for `{s}`"
+            );
+        }
+    }
+
+    #[test]
+    fn status_severity_classifies_empty_as_info() {
+        assert_eq!(classify_status_message(""), StatusSeverity::Info);
+        assert_eq!(classify_status_message("   "), StatusSeverity::Info);
+    }
+
+    #[test]
+    fn status_style_classifies_terminal_outcomes() {
+        // Pins the color contract for the status bar's right-side message:
+        // running → yellow, errors → red, everything else → green. This is
+        // also why the join-error branch in `pump_active_run` prefixes its
+        // message with "Failed" — otherwise a panicked task would render as
+        // a successful (green) outcome.
+        let yellow = Style::default().fg(Color::Yellow);
+        let red = Style::default().fg(Color::Red);
+        let green = Style::default().fg(Color::Green);
+
+        assert_eq!(status_style("Running…"), yellow);
+        assert_eq!(status_style("Running (abc12345)"), yellow);
+
+        assert_eq!(status_style("Failed in 123ms"), red);
+        assert_eq!(status_style("TimedOut in 60000ms"), red);
+        assert_eq!(status_style("Failed: spawn error"), red);
+        assert_eq!(
+            status_style("Failed: run task panicked: explicit panic"),
+            red,
+            "panicked-task status must route to red, not the green default"
+        );
+        assert_eq!(status_style("Unknown profile `foo`"), red);
+
+        assert_eq!(status_style("ready"), green);
+        assert_eq!(status_style("Succeeded in 42ms"), green);
+        assert_eq!(status_style("Cleared transcript"), green);
+    }
+
+    #[test]
     fn status_bar_idle_with_home_abbreviated() {
         let cwd = std::path::PathBuf::from("/home/me/forge-CLI");
         let home = std::path::PathBuf::from("/home/me");
@@ -2347,12 +2653,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_aborts_handle_and_clears_state() {
+    async fn cancel_first_press_signals_and_keeps_slot() {
+        // First Esc fires the graceful cancel signal and leaves the
+        // ActiveRun slot in place so `pump_active_run` can render the
+        // eventual Cancelled record naturally.
         let (_tx, rx) = mpsc::unbounded_channel();
-        // A future that would never complete on its own; we'll abort it.
         let handle = tokio::spawn(async {
             std::future::pending::<()>().await;
-            unreachable!("the task is aborted before it can finish")
+            Ok::<forge_cli::RunRecord, anyhow::Error>(unreachable!())
+        });
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut active_run = Some(ActiveRun {
+            handle,
+            rx,
+            started_at: Instant::now(),
+            assistant_open: false,
+            error_open: false,
+            assistant_buffer: String::new(),
+            cancel_tx: Some(cancel_tx),
+            cancel_requested: false,
+        });
+        let mut transcript: Vec<TranscriptEntry> = Vec::new();
+        let mut status = "Running…".to_string();
+
+        let cancelled = cancel_active_run(&mut active_run, &mut transcript, &mut status);
+
+        assert!(cancelled);
+        let active = active_run
+            .as_ref()
+            .expect("first press should keep the slot for the lib-side graceful exit");
+        assert!(active.cancel_requested);
+        assert!(
+            active.cancel_tx.is_none(),
+            "cancel_tx should be consumed by the send"
+        );
+        assert_eq!(transcript.len(), 1);
+        assert!(
+            transcript[0].text.starts_with("Run cancelled"),
+            "expected a `Run cancelled` system line, got: {:?}",
+            transcript[0].text
+        );
+        assert_eq!(status, "Cancelling…");
+        // The lib-side receiver should observe the cancel signal.
+        assert!(cancel_rx.await.is_ok());
+
+        // Cleanup: drop the slot so the background pending future doesn't
+        // outlive the test runtime.
+        if let Some(active) = active_run.take() {
+            active.handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_second_press_hard_aborts_and_clears_slot() {
+        // Second press while `cancel_requested` is already set escalates to
+        // a hard abort (drops the kill_on_drop child → SIGKILL).
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok::<forge_cli::RunRecord, anyhow::Error>(unreachable!())
         });
         let mut active_run = Some(ActiveRun {
             handle,
@@ -2361,18 +2720,23 @@ mod tests {
             assistant_open: false,
             error_open: false,
             assistant_buffer: String::new(),
+            cancel_tx: None,
+            cancel_requested: true,
         });
         let mut transcript: Vec<TranscriptEntry> = Vec::new();
-        let mut status = "Running…".to_string();
+        let mut status = "Cancelling…".to_string();
 
         let cancelled = cancel_active_run(&mut active_run, &mut transcript, &mut status);
 
         assert!(cancelled);
-        assert!(active_run.is_none(), "active_run slot should be cleared");
+        assert!(
+            active_run.is_none(),
+            "second press should drain the slot via hard abort"
+        );
         assert_eq!(transcript.len(), 1);
         assert!(
-            transcript[0].text.starts_with("Run cancelled"),
-            "expected a `Run cancelled` system line, got: {:?}",
+            transcript[0].text.contains("hard abort"),
+            "expected `hard abort` annotation, got: {:?}",
             transcript[0].text
         );
         assert_eq!(status, "Run cancelled");
@@ -2383,8 +2747,9 @@ mod tests {
         let (_tx, rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(async {
             std::future::pending::<()>().await;
-            unreachable!()
+            Ok::<forge_cli::RunRecord, anyhow::Error>(unreachable!())
         });
+        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let mut active_run = Some(ActiveRun {
             handle,
             rx,
@@ -2392,6 +2757,8 @@ mod tests {
             assistant_open: true,
             error_open: false,
             assistant_buffer: "partial response so far".to_string(),
+            cancel_tx: Some(cancel_tx),
+            cancel_requested: false,
         });
         let mut transcript: Vec<TranscriptEntry> = Vec::new();
         let mut status = String::new();
@@ -2403,6 +2770,9 @@ mod tests {
             "expected partial-output hint, got: {:?}",
             transcript[0].text
         );
+        if let Some(active) = active_run.take() {
+            active.handle.abort();
+        }
     }
 
     #[test]

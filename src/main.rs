@@ -425,6 +425,44 @@ async fn read_transcript_text(record: &forge_cli::RunRecord) -> Result<String> {
     Ok(stdout.trim_end_matches('\n').to_string())
 }
 
+/// Canonical command names that `handle_interactive_command` dispatches in
+/// the plain REPL. The parity test in `commands.rs` cross-checks this against
+/// `commands::COMMANDS`: every command must appear here OR be marked
+/// `is_tui_only()` in the registry. Keep in sync with the match arms below.
+#[allow(dead_code)]
+pub(crate) const PLAIN_DISPATCHED_COMMANDS: &[&str] = &[
+    "exit",
+    "help",
+    "profile",
+    "profiles",
+    "skills",
+    "skill",
+    "bypass",
+    "desktop",
+    "runs",
+    "last",
+    "retry",
+    "new",
+    "sessions",
+    "resume",
+    "fork",
+    "status",
+    "model",
+    "permissions",
+    "compact",
+    "provider",
+    "clear",
+    "doctor",
+];
+
+/// Names that the plain REPL recognizes only to print a "TUI-only" rejection
+/// message. Used by parity tests to assert the plain dispatcher's rejection
+/// arm and the registry's `is_tui_only()` flag agree.
+#[allow(dead_code)]
+pub(crate) const PLAIN_TUI_ONLY_COMMANDS: &[&str] = &[
+    "cancel", "smoke", "inspect", "open-run", "logs", "export", "jobs",
+];
+
 async fn handle_interactive_command(
     config: &forge_cli::HarnessConfig,
     runs_dir: &std::path::Path,
@@ -706,6 +744,16 @@ async fn handle_interactive_command(
             println!("command: {}", profile.command.join(" "));
             Ok(false)
         }
+        "doctor" => {
+            let checks =
+                forge_cli::run_doctor(config, &plain.session, runs_dir, &plain.sessions_dir).await;
+            for check in &checks {
+                println!("{}", check.format_line());
+            }
+            let (oks, warns, fails) = forge_cli::doctor_counts(&checks);
+            println!("-- {oks} OK, {warns} WARN, {fails} FAIL --");
+            Ok(false)
+        }
         "permissions" => {
             match parts.next() {
                 None => {
@@ -884,6 +932,11 @@ fn status_to_result(status: RunStatus) -> Result<()> {
         RunStatus::Succeeded => Ok(()),
         RunStatus::Failed => anyhow::bail!("agent run failed"),
         RunStatus::TimedOut => anyhow::bail!("agent run timed out"),
+        // Plain REPL / one-shot CLI can't initiate cancel today (only the TUI
+        // wires up the oneshot), so reaching this arm from those paths is
+        // genuinely surprising — surface it as a hard error rather than
+        // silently succeeding.
+        RunStatus::Cancelled => anyhow::bail!("agent run cancelled"),
     }
 }
 
@@ -898,7 +951,9 @@ async fn run_with_live_output(
     let config = config.clone();
     let runs_dir = runs_dir.to_path_buf();
     let handle =
-        tokio::spawn(async move { run_agent_streaming(&config, &runs_dir, request, tx).await });
+        tokio::spawn(
+            async move { run_agent_streaming(&config, &runs_dir, request, tx, None).await },
+        );
 
     while let Some(event) = rx.recv().await {
         match event {

@@ -34,6 +34,28 @@ pub(crate) struct SlashCommand {
     pub summary: &'static str,
     pub usage: &'static str,
     pub help: &'static str,
+    /// Whether this command is dispatched by the full-screen TUI. All
+    /// currently registered commands are TUI-supported; the flag is here so
+    /// parity tests can fail when a new command is added without TUI wiring.
+    /// Read only by tests in [`tests::every_command_is_dispatched_by_the_tui`].
+    #[allow(dead_code)]
+    pub tui: bool,
+    /// Whether this command is dispatched by the plain line-oriented REPL.
+    /// Commands that are intentionally TUI-only (because they depend on an
+    /// in-process active run or interactive controls) set this to `false` and
+    /// the plain REPL rejects them with a "TUI-only" message. Read only by
+    /// the registry parity tests.
+    #[allow(dead_code)]
+    pub plain: bool,
+}
+
+impl SlashCommand {
+    /// True when the command is supported in the TUI but intentionally not in
+    /// the plain REPL. Used by the registry parity tests.
+    #[allow(dead_code)]
+    pub(crate) fn is_tui_only(&self) -> bool {
+        self.tui && !self.plain
+    }
 }
 
 pub(crate) const COMMANDS: &[SlashCommand] = &[
@@ -43,6 +65,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "show this command list",
         usage: "/help",
         help: "Lists all available slash commands with usage and a one-line summary.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "status",
@@ -50,6 +74,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "show current state",
         usage: "/status",
         help: "Shows the current session id, profile, mode flags, active skills, working directory, and the most recent run id.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "clear",
@@ -57,6 +83,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "clear visible transcript",
         usage: "/clear",
         help: "Clear the visible terminal transcript. The persisted session transcript on disk is unaffected.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "exit",
@@ -64,6 +92,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "quit forge",
         usage: "/exit",
         help: "Save the current session and exit the TUI. /quit and /q are aliases.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "profile",
@@ -71,6 +101,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "switch agent profile",
         usage: "/profile <name>",
         help: "Switch the active agent profile. Without an argument, prints the current profile. Use /profiles to see configured options.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "profiles",
@@ -78,6 +110,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "list configured profiles",
         usage: "/profiles",
         help: "Print every profile name configured in the harness config TOML, in declared order.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "model",
@@ -85,6 +119,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "show the active profile command",
         usage: "/model",
         help: "Show the command line forge runs for each new prompt. Models are baked into the profile command, so this is informational; use /profile to switch to a profile with a different model.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "permissions",
@@ -92,6 +128,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "show or set permission mode",
         usage: "/permissions [guarded|bypass|desktop]",
         help: "Without an argument, prints the current permission mode. With one, sets the mode: guarded (no bypass), bypass (append the bypass flag), or desktop (bypass + inject the desktop control prompt prefix).",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "bypass",
@@ -99,6 +137,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "toggle dangerous permission bypass",
         usage: "/bypass [on|off]",
         help: "Toggle the per-session bypass flag. When on, forge appends the profile's bypass_args to the agent command.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "desktop",
@@ -106,6 +146,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "toggle desktop control prompting",
         usage: "/desktop [on|off]",
         help: "Toggle the desktop control prompt prefix. Enabling desktop also enables bypass automatically.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "skills",
@@ -113,6 +155,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "list discovered skills",
         usage: "/skills",
         help: "Walk the standard skill directories and list every SKILL.md found. Active skills are marked with `*`.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "skill",
@@ -120,6 +164,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "activate, clear, or create a skill",
         usage: "/skill <name>|clear|create <name>",
         help: "Add a skill body to the prompt prefix for the next turn. `/skill clear` removes all active skills. `/skill create <name>` scaffolds a new skill under <session-cwd>/skills/<name>/SKILL.md.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "runs",
@@ -127,6 +173,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "list recent runs",
         usage: "/runs",
         help: "Show the most recent agent runs in the runs directory, newest first.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "last",
@@ -134,6 +182,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "show last response",
         usage: "/last",
         help: "Show the transcript of the most recent run in this session.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "cancel",
@@ -141,6 +191,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "cancel the active run",
         usage: "/cancel",
         help: "Cancel the currently running agent invocation. This is the slash-command equivalent of pressing Esc while a run is active.",
+        tui: true,
+        plain: false,
     },
     SlashCommand {
         name: "retry",
@@ -148,6 +200,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "retry a run",
         usage: "/retry [id]",
         help: "Resubmit the prompt from a prior run. Without an id, retries the last run from this session.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "new",
@@ -155,6 +209,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "start a fresh session",
         usage: "/new",
         help: "Save the current session and start a new one, keeping the current profile, cwd, and mode.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "resume",
@@ -162,6 +218,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "resume a saved session",
         usage: "/resume [id]",
         help: "Load a saved session. Without an id, loads the most recently updated session other than the current one.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "sessions",
@@ -169,6 +227,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "list saved sessions",
         usage: "/sessions",
         help: "Show every persisted session, newest first, with id prefix, profile, turn count, and last-updated timestamp. The current session is marked with `*`.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "fork",
@@ -176,6 +236,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "fork a session into a branch",
         usage: "/fork [id]",
         help: "Create a new session that inherits the transcript and configuration of the current (or named) session.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "compact",
@@ -183,6 +245,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "drop early turns to shrink session",
         usage: "/compact [keep]",
         help: "Keep only the most recent `keep` (default 20) turns in the session transcript. Run records on disk are not deleted.",
+        tui: true,
+        plain: true,
     },
     SlashCommand {
         name: "smoke",
@@ -190,6 +254,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "send a quick health-check prompt",
         usage: "/smoke [prompt]",
         help: "Run a minimal prompt against the current profile to verify the agent is wired up. Defaults to `Reply exactly: ok`.",
+        tui: true,
+        plain: false,
     },
     SlashCommand {
         name: "inspect",
@@ -197,6 +263,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "show full record for a run",
         usage: "/inspect [id]",
         help: "Print the persisted JSON record for a run, including command line, cwd, exit code, durations, and log paths. Defaults to the most recent run.",
+        tui: true,
+        plain: false,
     },
     SlashCommand {
         name: "open-run",
@@ -204,6 +272,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "show transcript for a specific run",
         usage: "/open-run <id>",
         help: "Show the captured stdout/stderr for a specific run id (prefix matches).",
+        tui: true,
+        plain: false,
     },
     SlashCommand {
         name: "logs",
@@ -211,6 +281,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "show log file paths for a run",
         usage: "/logs [id]",
         help: "Print the stdout.log and stderr.log paths for a run so you can tail or open them externally.",
+        tui: true,
+        plain: false,
     },
     SlashCommand {
         name: "export",
@@ -218,6 +290,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "export the current session as markdown",
         usage: "/export <path>",
         help: "Write the active session transcript to <path> as Markdown. Errors if the file already exists.",
+        tui: true,
+        plain: false,
     },
     SlashCommand {
         name: "jobs",
@@ -225,6 +299,8 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "run batch jobs from a JSON or CSV file",
         usage: "/jobs <file> [concurrency]",
         help: "Run every job in <file> against the current profile. The TUI is unresponsive until the batch completes; cancel with Ctrl+C.",
+        tui: true,
+        plain: false,
     },
     SlashCommand {
         name: "provider",
@@ -232,11 +308,22 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         summary: "inspect or set the provider session id",
         usage: "/provider [show|clear|set <id>]",
         help: "Show, set, or clear the provider session id that forge sends via the profile's continue_args. Without an argument, prints the current id.",
+        tui: true,
+        plain: true,
+    },
+    SlashCommand {
+        name: "doctor",
+        category: Category::Session,
+        summary: "validate the harness environment",
+        usage: "/doctor",
+        help: "Run a battery of OK/WARN/FAIL checks against the active profile, command binary, cwd, runs/sessions directories, and skills. Use it after editing config or moving directories.",
+        tui: true,
+        plain: true,
     },
 ];
 
 /// Aliases handled by `lookup` so that `/q`, `/quit`, `/h` all resolve.
-const ALIASES: &[(&str, &str)] = &[("h", "help"), ("quit", "exit"), ("q", "exit")];
+pub(crate) const ALIASES: &[(&str, &str)] = &[("h", "help"), ("quit", "exit"), ("q", "exit")];
 
 /// Classification of free-form user input at submit time.
 ///
@@ -257,6 +344,45 @@ pub(crate) enum InputClass<'a> {
     UnknownSlash(&'a str),
     /// Plain prompt text (no leading `/`).
     Prompt,
+}
+
+/// What the Enter key should do for the current composer/REPL input, derived
+/// purely from the input text. The TUI and the plain REPL both Enter-route on
+/// this so the contract is testable without standing up a terminal.
+///
+/// Suggestion-pane behaviour is intentionally NOT modelled here. The TUI lets
+/// the suggestion palette steal Enter only while the input does *not* yet
+/// classify as a known command — i.e. while `classify_input` returns
+/// `UnknownSlash`/`Prompt`/`Path`. For complete commands (with or without
+/// arguments) the TUI bypasses the palette and dispatches verbatim. The test
+/// `route_enter_returns_command_for_known_slash_with_args` pins that contract.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EnterRoute {
+    /// Empty / whitespace-only input. Do nothing.
+    Noop,
+    /// Dispatch as command. The string is the command body (no leading `/`).
+    Command(String),
+    /// Submit to the agent as a prompt (also the case for path-looking input).
+    Submit(String),
+    /// Starts with `/` but is neither a known command nor a path. The string
+    /// is the first whitespace-delimited token so callers can build a
+    /// "did-you-mean" hint.
+    UnknownSlash(String),
+}
+
+/// Decide what Enter should do for `input`. Pure; safe to call from tests.
+#[allow(dead_code)]
+pub(crate) fn route_enter(input: &str) -> EnterRoute {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return EnterRoute::Noop;
+    }
+    match classify_input(trimmed) {
+        InputClass::Command(body) => EnterRoute::Command(body.to_string()),
+        InputClass::UnknownSlash(token) => EnterRoute::UnknownSlash(token.to_string()),
+        InputClass::Path | InputClass::Prompt => EnterRoute::Submit(trimmed.to_string()),
+    }
 }
 
 pub(crate) fn classify_input(input: &str) -> InputClass<'_> {
@@ -584,6 +710,301 @@ mod tests {
             assert!(
                 is_known(alias),
                 "alias `{alias}` should be recognized by is_known"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry parity tests.
+    //
+    // These guard the cross-module contract: every entry in COMMANDS must be
+    // accounted for in both dispatchers (TUI and plain REPL), and the registry
+    // itself must not contain duplicates or aliases that drift out of sync.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn commands_have_no_duplicate_names() {
+        let mut seen = std::collections::HashSet::new();
+        for cmd in COMMANDS {
+            assert!(
+                seen.insert(cmd.name),
+                "duplicate command entry `{}` in COMMANDS",
+                cmd.name
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_have_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for (alias, _) in ALIASES {
+            assert!(seen.insert(*alias), "duplicate alias `{alias}` in ALIASES");
+        }
+    }
+
+    #[test]
+    fn aliases_do_not_collide_with_command_names() {
+        // Otherwise `is_known` would be ambiguous about which entry wins.
+        for (alias, _) in ALIASES {
+            assert!(
+                !COMMANDS.iter().any(|cmd| cmd.name == *alias),
+                "alias `{alias}` collides with a registered command of the same name"
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_point_to_existing_commands() {
+        for (alias, target) in ALIASES {
+            assert!(
+                COMMANDS.iter().any(|cmd| cmd.name == *target),
+                "alias `{alias}` -> `{target}` points to a missing command"
+            );
+        }
+    }
+
+    #[test]
+    fn every_command_is_dispatched_by_the_tui() {
+        let dispatched: std::collections::HashSet<&str> =
+            crate::terminal_ui::TUI_DISPATCHED_COMMANDS
+                .iter()
+                .copied()
+                .collect();
+        for cmd in COMMANDS {
+            if !cmd.tui {
+                continue;
+            }
+            assert!(
+                dispatched.contains(cmd.name),
+                "command `/{}` declares tui=true but is not in \
+                 terminal_ui::TUI_DISPATCHED_COMMANDS — add the dispatch arm \
+                 and the constant entry together",
+                cmd.name
+            );
+        }
+    }
+
+    #[test]
+    fn tui_dispatched_list_only_contains_registered_commands() {
+        // Reverse direction: the dispatcher must not claim to handle a name
+        // that isn't in COMMANDS (otherwise help/listing would never surface
+        // it).
+        let registered: std::collections::HashSet<&str> =
+            COMMANDS.iter().map(|cmd| cmd.name).collect();
+        for name in crate::terminal_ui::TUI_DISPATCHED_COMMANDS {
+            assert!(
+                registered.contains(*name),
+                "TUI_DISPATCHED_COMMANDS includes `{name}` but no SlashCommand \
+                 entry exists in COMMANDS"
+            );
+        }
+    }
+
+    #[test]
+    fn every_command_is_dispatched_or_marked_tui_only_in_plain_repl() {
+        let dispatched: std::collections::HashSet<&str> =
+            crate::PLAIN_DISPATCHED_COMMANDS.iter().copied().collect();
+        let rejected: std::collections::HashSet<&str> =
+            crate::PLAIN_TUI_ONLY_COMMANDS.iter().copied().collect();
+        for cmd in COMMANDS {
+            if dispatched.contains(cmd.name) {
+                assert!(
+                    cmd.plain,
+                    "command `/{}` is dispatched in plain REPL but its \
+                     SlashCommand entry has plain=false",
+                    cmd.name
+                );
+                continue;
+            }
+            assert!(
+                cmd.is_tui_only(),
+                "command `/{}` is not handled by the plain REPL and is not \
+                 marked TUI-only in COMMANDS (tui={}, plain={})",
+                cmd.name,
+                cmd.tui,
+                cmd.plain
+            );
+            assert!(
+                rejected.contains(cmd.name),
+                "command `/{}` is marked TUI-only but the plain REPL doesn't \
+                 list it in PLAIN_TUI_ONLY_COMMANDS — its rejection branch \
+                 will fall through to the unknown-command arm",
+                cmd.name
+            );
+        }
+    }
+
+    #[test]
+    fn plain_dispatched_and_tui_only_lists_only_contain_registered_commands() {
+        let registered: std::collections::HashSet<&str> =
+            COMMANDS.iter().map(|cmd| cmd.name).collect();
+        for name in crate::PLAIN_DISPATCHED_COMMANDS {
+            assert!(
+                registered.contains(*name),
+                "PLAIN_DISPATCHED_COMMANDS includes `{name}` but no \
+                 SlashCommand entry exists"
+            );
+        }
+        for name in crate::PLAIN_TUI_ONLY_COMMANDS {
+            assert!(
+                registered.contains(*name),
+                "PLAIN_TUI_ONLY_COMMANDS includes `{name}` but no SlashCommand \
+                 entry exists"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_dispatched_and_tui_only_are_disjoint() {
+        // A name can't be both "plain dispatches it" and "plain rejects as
+        // TUI-only" — those are mutually exclusive code paths.
+        let dispatched: std::collections::HashSet<&str> =
+            crate::PLAIN_DISPATCHED_COMMANDS.iter().copied().collect();
+        for name in crate::PLAIN_TUI_ONLY_COMMANDS {
+            assert!(
+                !dispatched.contains(*name),
+                "command `{name}` appears in both PLAIN_DISPATCHED_COMMANDS \
+                 and PLAIN_TUI_ONLY_COMMANDS"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Enter-routing tests.
+    //
+    // Exercise the pure `route_enter` helper that both the TUI Enter handler
+    // and the plain REPL boil down to. These cover the cases called out in
+    // the harness hardening checklist: known commands (with and without args),
+    // unknown slashes, paths, plain prompts, and empty input.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn route_enter_dispatches_known_command() {
+        assert_eq!(
+            route_enter("/help"),
+            EnterRoute::Command("help".to_string())
+        );
+    }
+
+    #[test]
+    fn route_enter_dispatches_alias_as_canonical_body() {
+        // The body is "q" (the typed token), not "exit" — dispatchers handle
+        // both spellings. We just need to confirm Enter routes to Command.
+        match route_enter("/q") {
+            EnterRoute::Command(body) => assert_eq!(body, "q"),
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_enter_dispatches_permissions_bypass_with_full_body() {
+        assert_eq!(
+            route_enter("/permissions bypass"),
+            EnterRoute::Command("permissions bypass".to_string())
+        );
+    }
+
+    #[test]
+    fn route_enter_dispatches_profile_default_with_full_body() {
+        assert_eq!(
+            route_enter("/profile default"),
+            EnterRoute::Command("profile default".to_string())
+        );
+    }
+
+    #[test]
+    fn route_enter_dispatches_skill_clear_with_full_body() {
+        // This case used to be vulnerable to suggestion-pane Enter stealing
+        // (because `/skill clear` fuzzy-matches `/skills`). The classifier
+        // path returns Command for the full body, so the TUI dispatches
+        // verbatim without consulting the palette.
+        assert_eq!(
+            route_enter("/skill clear"),
+            EnterRoute::Command("skill clear".to_string())
+        );
+    }
+
+    #[test]
+    fn route_enter_dispatches_provider_set_with_full_body() {
+        assert_eq!(
+            route_enter("/provider set abc"),
+            EnterRoute::Command("provider set abc".to_string())
+        );
+    }
+
+    #[test]
+    fn route_enter_blocks_unknown_single_token_slash() {
+        match route_enter("/foobar") {
+            EnterRoute::UnknownSlash(tok) => assert_eq!(tok, "foobar"),
+            other => panic!("expected UnknownSlash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_enter_blocks_unknown_slash_with_args_using_first_token() {
+        // Multi-token unknown slash: the hint key is the leading token.
+        match route_enter("/foobar arg1 arg2") {
+            EnterRoute::UnknownSlash(tok) => assert_eq!(tok, "foobar"),
+            other => panic!("expected UnknownSlash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_enter_submits_nested_path_as_prompt() {
+        assert_eq!(
+            route_enter("/no/such/path/here"),
+            EnterRoute::Submit("/no/such/path/here".to_string())
+        );
+    }
+
+    #[test]
+    fn route_enter_submits_normal_text_as_prompt() {
+        assert_eq!(
+            route_enter("write me a haiku"),
+            EnterRoute::Submit("write me a haiku".to_string())
+        );
+    }
+
+    #[test]
+    fn route_enter_noops_on_empty_input() {
+        assert_eq!(route_enter(""), EnterRoute::Noop);
+        assert_eq!(route_enter("   "), EnterRoute::Noop);
+        assert_eq!(route_enter("\t\n"), EnterRoute::Noop);
+    }
+
+    #[test]
+    fn route_enter_trims_whitespace_before_classifying() {
+        assert_eq!(
+            route_enter("   /help   "),
+            EnterRoute::Command("help".to_string())
+        );
+        assert_eq!(
+            route_enter("   /profile default   "),
+            EnterRoute::Command("profile default".to_string())
+        );
+    }
+
+    #[test]
+    fn route_enter_returns_command_for_known_slash_with_args() {
+        // Pins the contract documented on `EnterRoute`: complete slash
+        // commands (with or without arguments) classify as Command, so
+        // suggestion/autocomplete in the TUI cannot steal Enter from them.
+        for input in [
+            "/help",
+            "/profile default",
+            "/permissions bypass",
+            "/skill clear",
+            "/skill create demo",
+            "/provider set abc123",
+            "/bypass on",
+            "/desktop off",
+            "/compact 50",
+            "/jobs jobs.json 4",
+        ] {
+            assert!(
+                matches!(route_enter(input), EnterRoute::Command(_)),
+                "input `{input}` should route as Command (got {:?})",
+                route_enter(input)
             );
         }
     }
