@@ -879,6 +879,10 @@ pub(crate) struct ChatWidget {
     retry_status_header: Option<String>,
     // Set when commentary output completes; once stream queues go idle we restore the status row.
     pending_status_indicator_restore: bool,
+    // Tail preview of assistant text that has arrived but may not have crossed a markdown commit
+    // boundary yet. The transcript remains source-backed; this only keeps long no-newline output
+    // visibly streaming in the status area.
+    streaming_status_preview: String,
     suppress_queue_autosend: bool,
     thread_id: Option<ThreadId>,
     /// Nudge dismissals that should survive draft edits within the current thread scope.
@@ -2458,6 +2462,7 @@ impl ChatWidget {
             self.bump_active_cell_revision();
         }
         self.pending_status_indicator_restore = false;
+        self.streaming_status_preview.clear();
         self.bottom_pane
             .set_interrupt_hint_visible(/*visible*/ true);
         self.terminal_title_status_kind = TerminalTitleStatusKind::Working;
@@ -3710,11 +3715,7 @@ impl ChatWidget {
                 return;
             }
         }
-        let item2 = item.clone();
-        self.defer_or_handle(
-            |q| q.push_item_started(item),
-            |s| s.handle_command_execution_started_now(item2),
-        );
+        self.handle_command_execution_started_now(item);
     }
 
     fn on_exec_command_output_delta(&mut self, call_id: &str, delta: &str) {
@@ -3824,11 +3825,7 @@ impl ChatWidget {
     }
 
     fn on_file_change_completed(&mut self, item: ThreadItem) {
-        let item2 = item.clone();
-        self.defer_or_handle(
-            |q| q.push_item_completed(item),
-            |s| s.handle_file_change_completed_now(item2),
-        );
+        self.handle_file_change_completed_now(item);
     }
 
     fn on_command_execution_completed(&mut self, item: ThreadItem) {
@@ -3855,11 +3852,7 @@ impl ChatWidget {
                 return;
             }
         }
-        let item2 = item.clone();
-        self.defer_or_handle(
-            |q| q.push_item_completed(item),
-            |s| s.handle_command_execution_completed_now(item2),
-        );
+        self.handle_command_execution_completed_now(item);
     }
 
     fn track_unified_exec_process_begin(
@@ -3936,19 +3929,14 @@ impl ChatWidget {
     }
 
     fn on_mcp_tool_call_started(&mut self, item: ThreadItem) {
-        let item2 = item.clone();
-        self.defer_or_handle(
-            |q| q.push_item_started(item),
-            |s| s.handle_mcp_tool_call_started_now(item2),
-        );
+        // Tool activity should be visible as it happens, even when the assistant has already
+        // started streaming a preamble. Interactive prompts still use `defer_or_handle` so they
+        // appear after visible text instead of interrupting it.
+        self.handle_mcp_tool_call_started_now(item);
     }
 
     fn on_mcp_tool_call_completed(&mut self, item: ThreadItem) {
-        let item2 = item.clone();
-        self.defer_or_handle(
-            |q| q.push_item_completed(item),
-            |s| s.handle_mcp_tool_call_completed_now(item2),
-        );
+        self.handle_mcp_tool_call_completed_now(item);
     }
 
     fn on_web_search_begin(&mut self, call_id: String) {
@@ -4309,12 +4297,14 @@ impl ChatWidget {
             self.bottom_pane.hide_status_indicator();
             self.task_complete_pending = false;
         }
+        self.streaming_status_preview.clear();
         // A completed stream indicates non-exec content was just inserted.
         self.flush_interrupt_queue();
     }
 
     #[inline]
     fn handle_streaming_delta(&mut self, delta: String) {
+        self.update_streaming_status_preview(&delta);
         // Before streaming agent content, flush any active exec cell group.
         self.flush_unified_exec_wait_streak();
         self.flush_active_cell();
@@ -4344,6 +4334,44 @@ impl ChatWidget {
             self.run_catch_up_commit_tick();
         }
         self.request_redraw();
+    }
+
+    fn update_streaming_status_preview(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+
+        self.streaming_status_preview.push_str(delta);
+        const MAX_PREVIEW_CHARS: usize = 240;
+        let char_count = self.streaming_status_preview.chars().count();
+        if char_count > MAX_PREVIEW_CHARS {
+            self.streaming_status_preview = self
+                .streaming_status_preview
+                .chars()
+                .skip(char_count - MAX_PREVIEW_CHARS)
+                .collect();
+        }
+
+        let preview = self
+            .streaming_status_preview
+            .lines()
+            .rev()
+            .find_map(|line| {
+                let trimmed = line.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+            .unwrap_or_else(|| self.streaming_status_preview.trim().to_string());
+        if preview.is_empty() {
+            return;
+        }
+
+        self.bottom_pane.ensure_status_indicator();
+        self.set_status(
+            self.current_status.header.clone(),
+            Some(preview),
+            StatusDetailsCapitalization::Preserve,
+            1,
+        );
     }
 
     /// Finalizes an exec call while preserving the active exec cell grouping contract.
@@ -4781,29 +4809,6 @@ impl ChatWidget {
         self.had_work_activity = true;
     }
 
-    pub(crate) fn handle_queued_item_started_now(&mut self, item: ThreadItem) {
-        match item {
-            item @ ThreadItem::CommandExecution { .. } => {
-                self.handle_command_execution_started_now(item);
-            }
-            item @ ThreadItem::McpToolCall { .. } => {
-                self.handle_mcp_tool_call_started_now(item);
-            }
-            _ => {}
-        }
-    }
-
-    pub(crate) fn handle_queued_item_completed_now(&mut self, item: ThreadItem) {
-        match item {
-            item @ ThreadItem::CommandExecution { .. } => {
-                self.handle_command_execution_completed_now(item);
-            }
-            item @ ThreadItem::FileChange { .. } => self.handle_file_change_completed_now(item),
-            item @ ThreadItem::McpToolCall { .. } => self.handle_mcp_tool_call_completed_now(item),
-            _ => {}
-        }
-    }
-
     pub(crate) fn new_with_app_event(common: ChatWidgetInit) -> Self {
         Self::new_with_op_target(common, CodexOpTarget::AppEvent)
     }
@@ -4965,6 +4970,7 @@ impl ChatWidget {
             terminal_title_status_kind: TerminalTitleStatusKind::Working,
             retry_status_header: None,
             pending_status_indicator_restore: false,
+            streaming_status_preview: String::new(),
             suppress_queue_autosend: false,
             thread_id: None,
             dismissed_plan_mode_nudge_scopes: HashSet::new(),

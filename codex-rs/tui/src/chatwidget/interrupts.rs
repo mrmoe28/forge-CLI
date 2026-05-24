@@ -7,7 +7,6 @@ use crate::approval_events::ApplyPatchApprovalRequestEvent;
 use crate::approval_events::ExecApprovalRequestEvent;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
 use codex_app_server_protocol::RequestId as AppServerRequestId;
-use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ToolRequestUserInputParams;
 use codex_protocol::request_permissions::RequestPermissionsEvent;
 
@@ -23,8 +22,6 @@ pub(crate) enum QueuedInterrupt {
     },
     RequestPermissions(RequestPermissionsEvent),
     RequestUserInput(ToolRequestUserInputParams),
-    ItemStarted(ThreadItem),
-    ItemCompleted(ThreadItem),
 }
 
 #[derive(Default)]
@@ -71,14 +68,6 @@ impl InterruptManager {
         self.queue.push_back(QueuedInterrupt::RequestUserInput(ev));
     }
 
-    pub(crate) fn push_item_started(&mut self, item: ThreadItem) {
-        self.queue.push_back(QueuedInterrupt::ItemStarted(item));
-    }
-
-    pub(crate) fn push_item_completed(&mut self, item: ThreadItem) {
-        self.queue.push_back(QueuedInterrupt::ItemCompleted(item));
-    }
-
     pub(crate) fn remove_resolved_prompt(&mut self, request: &ResolvedAppServerRequest) -> bool {
         let original_len = self.queue.len();
         self.queue
@@ -96,10 +85,6 @@ impl InterruptManager {
                 }
                 QueuedInterrupt::RequestPermissions(ev) => chat.handle_request_permissions_now(ev),
                 QueuedInterrupt::RequestUserInput(ev) => chat.handle_request_user_input_now(ev),
-                QueuedInterrupt::ItemStarted(item) => chat.handle_queued_item_started_now(item),
-                QueuedInterrupt::ItemCompleted(item) => {
-                    chat.handle_queued_item_completed_now(item);
-                }
             }
         }
     }
@@ -130,7 +115,6 @@ impl QueuedInterrupt {
                 matches!(request, ResolvedAppServerRequest::UserInput { call_id }
                     if ev.item_id == call_id.as_str())
             }
-            QueuedInterrupt::ItemStarted(_) | QueuedInterrupt::ItemCompleted(_) => false,
         }
     }
 }
@@ -138,9 +122,6 @@ impl QueuedInterrupt {
 #[cfg(test)]
 mod tests {
     use crate::approval_events::ExecApprovalRequestEvent;
-    use codex_app_server_protocol::CommandExecutionSource;
-    use codex_app_server_protocol::CommandExecutionStatus;
-    use codex_app_server_protocol::ThreadItem;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
 
@@ -168,21 +149,6 @@ mod tests {
             proposed_network_policy_amendments: None,
             additional_permissions: None,
             available_decisions: None,
-        }
-    }
-
-    fn command_execution(call_id: &str) -> ThreadItem {
-        ThreadItem::CommandExecution {
-            id: call_id.to_string(),
-            command: "true".to_string(),
-            cwd: AbsolutePathBuf::current_dir().expect("current dir"),
-            process_id: None,
-            source: CommandExecutionSource::Agent,
-            status: CommandExecutionStatus::InProgress,
-            command_actions: Vec::new(),
-            aggregated_output: None,
-            exit_code: None,
-            duration_ms: None,
         }
     }
 
@@ -223,23 +189,5 @@ mod tests {
             })
         );
         assert!(manager.queue.is_empty());
-    }
-
-    #[test]
-    fn remove_resolved_prompt_keeps_lifecycle_events() {
-        let mut manager = InterruptManager::new();
-        manager.push_item_started(command_execution("call"));
-
-        assert!(
-            !manager.remove_resolved_prompt(&ResolvedAppServerRequest::ExecApproval {
-                id: "call".to_string(),
-            })
-        );
-
-        assert_eq!(manager.queue.len(), 1);
-        assert!(matches!(
-            manager.queue.front(),
-            Some(QueuedInterrupt::ItemStarted(_))
-        ));
     }
 }
