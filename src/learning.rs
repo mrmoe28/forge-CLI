@@ -1,11 +1,12 @@
-//! Minimal, explicit learning storage for the harness.
+//! Minimal learning storage for the harness.
 //!
-//! The learning layer is deliberately small: it lets the user explicitly
-//! record short notes (`/learn save <note>`), review them, accept the ones
-//! worth keeping, and forget anything that turns out to be wrong. Nothing is
-//! captured automatically — no transcript scraping, no embedding, no silent
-//! prompt injection. Notes live as Markdown files the user can read with any
-//! editor.
+//! The learning layer stays deliberately small: users can explicitly record
+//! short notes (`/learn save <note>`), review them, accept the ones worth
+//! keeping, and forget anything that turns out to be wrong. The harness also
+//! auto-captures concise pending notes from completed runs so successes and
+//! failures can be reviewed instead of disappearing into logs. Only accepted
+//! notes are injected back into future prompts. Notes live as Markdown files
+//! the user can read with any editor.
 //!
 //! Layout under `default_learning_dir()` (or the dir passed in):
 //!
@@ -32,6 +33,9 @@ use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
+
+use crate::RunRecord;
+use crate::RunStatus;
 
 pub const DEFAULT_LEARNING_DIR: &str = ".codex/external-agent-harness/learning";
 
@@ -110,6 +114,23 @@ pub struct LearningStatus {
     pub accepted: usize,
     pub rejected: usize,
     pub disabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutoLearnCapture<'a> {
+    pub record: &'a RunRecord,
+    pub prompt: &'a str,
+    pub stdout: &'a str,
+    pub stderr: &'a str,
+    pub retry_of: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AutoLearnOutcome {
+    Saved(LearnNote),
+    Duplicate { existing_id: String },
+    Disabled,
+    Skipped,
 }
 
 /// Whether `/learn save` is currently disabled via the `.disabled` marker.
@@ -200,6 +221,41 @@ pub async fn list_pending(dir: &Path) -> Result<Vec<LearnNote>> {
 /// List accepted notes, newest first.
 pub async fn list_accepted(dir: &Path) -> Result<Vec<LearnNote>> {
     list_state(dir, LearnState::Accepted).await
+}
+
+pub fn accepted_notes_prompt(notes: &[LearnNote], limit: usize) -> Option<String> {
+    if notes.is_empty() || limit == 0 {
+        return None;
+    }
+    let mut prompt =
+        String::from("Apply the following accepted lessons from prior runs when relevant:\n");
+    for note in notes.iter().take(limit) {
+        prompt.push_str("\n--- learned note: ");
+        prompt.push_str(&note.id);
+        prompt.push_str(" ---\n");
+        prompt.push_str(note.body.trim());
+        prompt.push('\n');
+    }
+    Some(prompt)
+}
+
+pub async fn auto_capture_run(
+    dir: &Path,
+    capture: AutoLearnCapture<'_>,
+) -> Result<AutoLearnOutcome> {
+    if is_disabled(dir).await {
+        return Ok(AutoLearnOutcome::Disabled);
+    }
+    if matches!(capture.record.status, RunStatus::Cancelled) {
+        return Ok(AutoLearnOutcome::Skipped);
+    }
+
+    let body = render_auto_learn_body(&capture);
+    if let Some(existing_id) = find_existing_note_with_body(dir, &body).await? {
+        return Ok(AutoLearnOutcome::Duplicate { existing_id });
+    }
+    let note = save_pending(dir, &body).await?;
+    Ok(AutoLearnOutcome::Saved(note))
 }
 
 /// Find a note by prefix across pending, accepted, then rejected notes.
@@ -385,9 +441,116 @@ fn format_note_detail(note: &LearnNote) -> Vec<String> {
     lines
 }
 
+fn render_auto_learn_body(capture: &AutoLearnCapture<'_>) -> String {
+    let record = capture.record;
+    let prompt = trim_block(capture.prompt, 800);
+    let stdout = trim_block(capture.stdout, 800);
+    let stderr = trim_block(capture.stderr, 800);
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{} observed from run {}.",
+        status_intro(record.status, capture.retry_of.is_some()),
+        short_id(&record.id)
+    ));
+    lines.push(String::new());
+    lines.push(format!("- status: {}", status_label(record.status)));
+    lines.push(format!("- profile: {}", record.profile));
+    lines.push(format!("- cwd: {}", record.cwd.display()));
+    if let Some(retry_of) = capture.retry_of {
+        lines.push(format!("- retry_of: {}", short_id(retry_of)));
+    }
+    lines.push(String::new());
+    lines.push("Prompt:".to_string());
+    lines.push("```text".to_string());
+    lines.push(prompt);
+    lines.push("```".to_string());
+    if !stdout.is_empty() {
+        lines.push(String::new());
+        lines.push("Observed stdout:".to_string());
+        lines.push("```text".to_string());
+        lines.push(stdout);
+        lines.push("```".to_string());
+    }
+    if !stderr.is_empty() {
+        lines.push(String::new());
+        lines.push("Observed stderr:".to_string());
+        lines.push("```text".to_string());
+        lines.push(stderr);
+        lines.push("```".to_string());
+    }
+    lines.push(String::new());
+    lines.push(match record.status {
+        RunStatus::Succeeded => {
+            "What worked: this prompt/run combination completed successfully. Reuse the successful pattern if the same task shape appears again.".to_string()
+        }
+        RunStatus::Failed => {
+            "What did not work: this run failed. Check the prompt, tool choice, and stderr before repeating the same approach.".to_string()
+        }
+        RunStatus::TimedOut => {
+            "What did not work: this run timed out. Break the task into smaller steps or shorten the operation next time.".to_string()
+        }
+        RunStatus::Cancelled => unreachable!("cancelled runs are skipped before rendering"),
+    });
+    lines.join("\n")
+}
+
+fn status_intro(status: RunStatus, was_retry: bool) -> &'static str {
+    match (status, was_retry) {
+        (RunStatus::Succeeded, true) => "Successful retry",
+        (RunStatus::Succeeded, false) => "Successful run",
+        (RunStatus::Failed, true) => "Failed retry",
+        (RunStatus::Failed, false) => "Failed run",
+        (RunStatus::TimedOut, true) => "Timed-out retry",
+        (RunStatus::TimedOut, false) => "Timed-out run",
+        (RunStatus::Cancelled, _) => "Cancelled run",
+    }
+}
+
+fn status_label(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Succeeded => "succeeded",
+        RunStatus::Failed => "failed",
+        RunStatus::TimedOut => "timed_out",
+        RunStatus::Cancelled => "cancelled",
+    }
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn trim_block(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        return trimmed.to_string();
+    }
+    let head: String = trimmed.chars().take(max_chars).collect();
+    format!("{head}\n…")
+}
+
 // ----------------------------------------------------------------------------
 // internals
 // ----------------------------------------------------------------------------
+
+async fn find_existing_note_with_body(dir: &Path, body: &str) -> Result<Option<String>> {
+    for state in [
+        LearnState::Pending,
+        LearnState::Accepted,
+        LearnState::Rejected,
+    ] {
+        for note in list_state(dir, state).await? {
+            if note.body.trim() == body.trim() {
+                return Ok(Some(note.id));
+            }
+        }
+    }
+    Ok(None)
+}
 
 async fn count_notes(dir: &Path) -> Result<usize> {
     let mut entries = match fs::read_dir(dir).await {
@@ -675,6 +838,80 @@ mod tests {
         let prefix: String = note.id.chars().take(4).collect();
         let accepted = accept(&dir, &prefix).await?;
         assert_eq!(accepted.id, note.id);
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_notes_prompt_renders_notes() {
+        let notes = vec![LearnNote {
+            id: "abc12345".to_string(),
+            state: LearnState::Accepted,
+            created_at: Utc::now(),
+            body: "Prefer rg for repo-wide search.".to_string(),
+            path: PathBuf::from("/tmp/abc12345.md"),
+        }];
+        let prompt = accepted_notes_prompt(&notes, 8).expect("prompt");
+        assert!(prompt.contains("accepted lessons from prior runs"));
+        assert!(prompt.contains("abc12345"));
+        assert!(prompt.contains("Prefer rg"));
+    }
+
+    #[tokio::test]
+    async fn auto_capture_run_saves_once_and_dedupes() -> Result<()> {
+        let temp = TempDir::new()?;
+        let dir = temp.path().to_path_buf();
+        let record = RunRecord {
+            id: "abcdef123456".to_string(),
+            profile: "default".to_string(),
+            label: None,
+            prompt: "fix the failing test".to_string(),
+            command: vec!["agent".to_string()],
+            cwd: dir.clone(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            duration_ms: 1234,
+            timeout_secs: Some(60),
+            status: RunStatus::Failed,
+            exit_code: Some(1),
+            stdout_log: dir.join("stdout.log"),
+            stderr_log: dir.join("stderr.log"),
+            captured_session_id: None,
+        };
+
+        let first = auto_capture_run(
+            &dir,
+            AutoLearnCapture {
+                record: &record,
+                prompt: &record.prompt,
+                stdout: "stdout line",
+                stderr: "stderr line",
+                retry_of: None,
+            },
+        )
+        .await?;
+        match first {
+            AutoLearnOutcome::Saved(note) => {
+                assert!(!note.id.is_empty());
+                assert!(note.body.contains("What did not work"));
+            }
+            other => panic!("expected Saved, got {other:?}"),
+        }
+
+        let second = auto_capture_run(
+            &dir,
+            AutoLearnCapture {
+                record: &record,
+                prompt: &record.prompt,
+                stdout: "stdout line",
+                stderr: "stderr line",
+                retry_of: None,
+            },
+        )
+        .await?;
+        match second {
+            AutoLearnOutcome::Duplicate { existing_id } => assert!(!existing_id.is_empty()),
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
         Ok(())
     }
 

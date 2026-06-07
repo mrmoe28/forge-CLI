@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::ExitStatus;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use tokio::fs;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
-use tokio::process::Command;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -28,7 +29,8 @@ pub mod learning;
 
 pub const DEFAULT_RUNS_DIR: &str = ".codex/external-agent-harness/runs";
 pub const DEFAULT_SESSIONS_DIR: &str = ".codex/external-agent-harness/sessions";
-const DEFAULT_PROFILE: &str = "default";
+pub const DEFAULT_ATTACHMENTS_DIR: &str = ".codex/external-agent-harness/attachments";
+pub const DEFAULT_PROFILE: &str = "default";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HarnessConfig {
@@ -39,6 +41,12 @@ pub struct HarnessConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentProfile {
     pub command: Vec<String>,
+    #[serde(default)]
+    pub backend: BackendKind,
+    #[serde(default)]
+    pub mode: Option<ProfileMode>,
+    #[serde(default)]
+    pub transport: StreamTransport,
     #[serde(default)]
     pub bypass_args: Vec<String>,
     #[serde(default)]
@@ -64,6 +72,198 @@ pub struct AgentProfile {
     /// `continue_args`.
     #[serde(default)]
     pub session_id_capture_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    #[default]
+    GenericCli,
+    Opencode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileMode {
+    Default,
+    Local,
+    Cloud,
+}
+
+impl ProfileMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProfileMode::Default => "default",
+            ProfileMode::Local => "local",
+            ProfileMode::Cloud => "cloud",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentCapabilities {
+    pub supports_continue: bool,
+    pub supports_bypass: bool,
+    pub supports_desktop: bool,
+}
+
+fn field_capabilities(profile: &AgentProfile) -> AgentCapabilities {
+    AgentCapabilities {
+        supports_continue: !profile.continue_args.is_empty()
+            || profile.session_id_capture_prefix.is_some(),
+        supports_bypass: !profile.bypass_args.is_empty(),
+        supports_desktop: !profile.desktop_args.is_empty()
+            || profile.desktop_prompt_prefix.is_some(),
+    }
+}
+
+type BackendFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+trait BackendAdapter: Sync + Send {
+    fn capabilities(&self, profile: &AgentProfile) -> AgentCapabilities;
+
+    fn continuation_args(&self, profile: &AgentProfile) -> Vec<String>;
+
+    fn session_id_capture_prefix<'a>(&self, profile: &'a AgentProfile) -> Option<&'a str>;
+
+    fn build_command(
+        &self,
+        profile: &AgentProfile,
+        prompt: &str,
+        request: &RunRequest,
+    ) -> Vec<String>;
+
+    fn extract_session_id<'a>(
+        &self,
+        profile: &'a AgentProfile,
+        stdout_log: &'a Path,
+    ) -> BackendFuture<'a, Result<Option<String>>>;
+
+    fn interpret_chunk(
+        &self,
+        _profile: &AgentProfile,
+        _kind: StreamKind,
+        _chunk: &StreamChunk,
+    ) -> Vec<BackendEvent> {
+        Vec::new()
+    }
+}
+
+struct GenericCliAdapter;
+struct OpencodeAdapter;
+
+impl BackendAdapter for GenericCliAdapter {
+    fn capabilities(&self, profile: &AgentProfile) -> AgentCapabilities {
+        field_capabilities(profile)
+    }
+
+    fn continuation_args(&self, profile: &AgentProfile) -> Vec<String> {
+        profile.continue_args.clone()
+    }
+
+    fn session_id_capture_prefix<'a>(&self, profile: &'a AgentProfile) -> Option<&'a str> {
+        profile.session_id_capture_prefix.as_deref()
+    }
+
+    fn build_command(
+        &self,
+        profile: &AgentProfile,
+        prompt: &str,
+        request: &RunRequest,
+    ) -> Vec<String> {
+        build_generic_command(profile, prompt, request, &self.continuation_args(profile))
+    }
+
+    fn extract_session_id<'a>(
+        &self,
+        profile: &'a AgentProfile,
+        stdout_log: &'a Path,
+    ) -> BackendFuture<'a, Result<Option<String>>> {
+        Box::pin(extract_prefixed_session_id(
+            stdout_log,
+            self.session_id_capture_prefix(profile),
+        ))
+    }
+}
+
+impl BackendAdapter for OpencodeAdapter {
+    fn capabilities(&self, profile: &AgentProfile) -> AgentCapabilities {
+        let mut capabilities = field_capabilities(profile);
+        capabilities.supports_continue = true;
+        capabilities
+    }
+
+    fn continuation_args(&self, profile: &AgentProfile) -> Vec<String> {
+        if profile.continue_args.is_empty() {
+            vec!["--session".to_string(), "{session_id}".to_string()]
+        } else {
+            profile.continue_args.clone()
+        }
+    }
+
+    fn session_id_capture_prefix<'a>(&self, profile: &'a AgentProfile) -> Option<&'a str> {
+        profile
+            .session_id_capture_prefix
+            .as_deref()
+            .or(Some("session: "))
+    }
+
+    fn build_command(
+        &self,
+        profile: &AgentProfile,
+        prompt: &str,
+        request: &RunRequest,
+    ) -> Vec<String> {
+        build_generic_command(profile, prompt, request, &self.continuation_args(profile))
+    }
+
+    fn extract_session_id<'a>(
+        &self,
+        profile: &'a AgentProfile,
+        stdout_log: &'a Path,
+    ) -> BackendFuture<'a, Result<Option<String>>> {
+        Box::pin(extract_prefixed_session_id(
+            stdout_log,
+            self.session_id_capture_prefix(profile),
+        ))
+    }
+
+    fn interpret_chunk(
+        &self,
+        profile: &AgentProfile,
+        kind: StreamKind,
+        chunk: &StreamChunk,
+    ) -> Vec<BackendEvent> {
+        if kind != StreamKind::Stdout || chunk.text.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if let Some(prefix) = self.session_id_capture_prefix(profile)
+            && chunk.text.starts_with(prefix)
+        {
+            out.push(BackendEvent::Notice(
+                "backend announced provider session id".to_string(),
+            ));
+        }
+        if chunk.text.starts_with("Build ")
+            || chunk.text.starts_with("Plan ")
+            || chunk.text.starts_with("Exec ")
+        {
+            out.push(BackendEvent::Progress(chunk.text.clone()));
+        }
+        out
+    }
+}
+
+fn backend_adapter(kind: BackendKind) -> &'static (dyn BackendAdapter + Sync + Send) {
+    match kind {
+        BackendKind::GenericCli => &GenericCliAdapter,
+        BackendKind::Opencode => &OpencodeAdapter,
+    }
+}
+
+pub fn effective_profile_capabilities(profile: &AgentProfile) -> AgentCapabilities {
+    backend_adapter(profile.backend).capabilities(profile)
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +303,14 @@ pub struct RunRecord {
     pub captured_session_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamTransport {
+    #[default]
+    Line,
+    Raw,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -119,15 +327,22 @@ pub enum RunStatus {
 /// Live event emitted by [`run_agent_streaming`].
 ///
 /// `Started` is fired immediately after the subprocess is spawned. `Stdout` /
-/// `Stderr` are line-buffered text chunks (newline-stripped). `Completed`
-/// fires exactly once, after both pipes have closed and the [`RunRecord`] has
-/// been persisted to disk.
+/// `Stderr` carry streamed text chunks plus trailing-line-ending metadata.
+/// `Completed` fires exactly once, after both pipes have closed and the
+/// [`RunRecord`] has been persisted to disk.
 #[derive(Debug, Clone)]
 pub enum RunEvent {
     Started(RunStarted),
-    Stdout(String),
-    Stderr(String),
+    Backend(BackendEvent),
+    Stdout(StreamChunk),
+    Stderr(StreamChunk),
     Completed(Box<RunRecord>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendEvent {
+    Notice(String),
+    Progress(String),
 }
 
 #[derive(Debug, Clone)]
@@ -138,7 +353,27 @@ pub struct RunStarted {
     pub started_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamChunk {
+    pub text: String,
+    pub trailing_newlines: u8,
+}
+
+impl StreamChunk {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let (text, trailing_newlines) = split_trailing_newlines(bytes);
+        Self {
+            text,
+            trailing_newlines,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.trailing_newlines == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamKind {
     Stdout,
     Stderr,
@@ -438,6 +673,139 @@ pub fn default_runs_dir() -> Result<PathBuf> {
     Ok(cwd.join(DEFAULT_RUNS_DIR))
 }
 
+pub fn default_attachments_dir() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    Ok(cwd.join(DEFAULT_ATTACHMENTS_DIR))
+}
+
+pub fn import_clipboard_image(attachments_dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(attachments_dir)
+        .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
+    let path = attachments_dir.join(format!(
+        "pasted-{}-{}.png",
+        Utc::now().format("%Y%m%dT%H%M%S"),
+        &Uuid::new_v4().to_string()[..8]
+    ));
+    let mut tried = Vec::new();
+
+    if let Some(bytes) = clipboard_png_from_wayland(&mut tried)? {
+        std::fs::write(&path, bytes)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        return Ok(path);
+    }
+    if let Some(bytes) = clipboard_png_from_x11(&mut tried)? {
+        std::fs::write(&path, bytes)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        return Ok(path);
+    }
+    if clipboard_png_from_macos(&path, &mut tried)? {
+        return Ok(path);
+    }
+
+    let tried = if tried.is_empty() {
+        "no clipboard import tools available".to_string()
+    } else {
+        format!("tried {}", tried.join(", "))
+    };
+    Err(anyhow!("clipboard does not contain a PNG image ({tried})"))
+}
+
+fn clipboard_png_from_wayland(tried: &mut Vec<&'static str>) -> Result<Option<Vec<u8>>> {
+    let Some(types) = run_clipboard_command("wl-paste", &["--list-types"], tried)? else {
+        return Ok(None);
+    };
+    if !clipboard_types_contain_png(&types.stdout) {
+        return Ok(None);
+    }
+    let output = std::process::Command::new("wl-paste")
+        .args(["--no-newline", "--type", "image/png"])
+        .output()
+        .context("failed to run wl-paste for PNG data")?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(output.stdout))
+}
+
+fn clipboard_png_from_x11(tried: &mut Vec<&'static str>) -> Result<Option<Vec<u8>>> {
+    let Some(types) = run_clipboard_command(
+        "xclip",
+        &["-selection", "clipboard", "-t", "TARGETS", "-o"],
+        tried,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !clipboard_types_contain_png(&types.stdout) {
+        return Ok(None);
+    }
+    let output = std::process::Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", "image/png", "-o"])
+        .output()
+        .context("failed to run xclip for PNG data")?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(output.stdout))
+}
+
+fn clipboard_png_from_macos(path: &Path, tried: &mut Vec<&'static str>) -> Result<bool> {
+    let status = run_clipboard_status("pngpaste", &[path.as_os_str()], tried)?;
+    Ok(matches!(status, Some(status) if status.success()))
+}
+
+fn run_clipboard_command(
+    program: &'static str,
+    args: &[&str],
+    tried: &mut Vec<&'static str>,
+) -> Result<Option<std::process::Output>> {
+    let Some(mut command) = clipboard_command_if_available(program, tried) else {
+        return Ok(None);
+    };
+    let output = command
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run {program}"))?;
+    Ok(Some(output))
+}
+
+fn run_clipboard_status(
+    program: &'static str,
+    args: &[&std::ffi::OsStr],
+    tried: &mut Vec<&'static str>,
+) -> Result<Option<ExitStatus>> {
+    let Some(mut command) = clipboard_command_if_available(program, tried) else {
+        return Ok(None);
+    };
+    let status = command
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run {program}"))?;
+    Ok(Some(status))
+}
+
+fn clipboard_command_if_available(
+    program: &'static str,
+    tried: &mut Vec<&'static str>,
+) -> Option<std::process::Command> {
+    tried.push(program);
+    which_in_path(program).map(std::process::Command::new)
+}
+
+fn which_in_path(program: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+fn clipboard_types_contain_png(raw: &[u8]) -> bool {
+    std::str::from_utf8(raw)
+        .ok()
+        .map(|text| text.lines().any(|line| line.trim() == "image/png"))
+        .unwrap_or(false)
+}
+
 pub async fn discover_skills(cwd: &Path) -> Result<Vec<Skill>> {
     let mut roots = vec![
         cwd.join(".agents/skills"),
@@ -625,9 +993,10 @@ pub async fn run_agent_streaming(
         .await
         .with_context(|| format!("failed to write {}", prompt_file.display()))?;
 
+    let adapter = backend_adapter(profile.backend);
     let prompt = resolved_prompt(profile, &request);
-    let command_line = resolved_command(profile, &prompt, &request);
-    let mut command = Command::new(&command_line[0]);
+    let command_line = adapter.build_command(profile, &prompt, &request);
+    let mut command = TokioCommand::new(&command_line[0]);
     command.args(&command_line[1..]);
     command.current_dir(&cwd);
     command.envs(&profile.env);
@@ -669,12 +1038,16 @@ pub async fn run_agent_streaming(
         stdout,
         stdout_log.clone(),
         StreamKind::Stdout,
+        profile.clone(),
+        profile.transport,
         events.clone(),
     ));
     let stderr_task = tokio::spawn(stream_pipe(
         stderr,
         stderr_log.clone(),
         StreamKind::Stderr,
+        profile.clone(),
+        profile.transport,
         events.clone(),
     ));
 
@@ -692,12 +1065,11 @@ pub async fn run_agent_streaming(
         WaitOutcome::TimedOut => (RunStatus::TimedOut, None),
         WaitOutcome::Cancelled => (RunStatus::Cancelled, None),
     };
-    let captured_session_id = match profile.session_id_capture_prefix.as_deref() {
-        Some(prefix) if !prefix.is_empty() => {
-            extract_session_id(&stdout_log, prefix).await.ok().flatten()
-        }
-        _ => None,
-    };
+    let captured_session_id = adapter
+        .extract_session_id(profile, &stdout_log)
+        .await
+        .ok()
+        .flatten();
     let record = RunRecord {
         id,
         profile: request.profile,
@@ -721,8 +1093,15 @@ pub async fn run_agent_streaming(
 }
 
 /// Scan a captured stdout log for the first line beginning with `prefix` and
-/// return the trimmed remainder. Returns `Ok(None)` if no line matches.
-async fn extract_session_id(log_path: &Path, prefix: &str) -> Result<Option<String>> {
+/// return the trimmed remainder. Returns `Ok(None)` if no line matches or the
+/// backend does not declare a capture prefix.
+async fn extract_prefixed_session_id(
+    log_path: &Path,
+    prefix: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(prefix) = prefix.filter(|prefix| !prefix.is_empty()) else {
+        return Ok(None);
+    };
     let body = fs::read_to_string(log_path).await?;
     for line in body.lines() {
         if let Some(rest) = line.strip_prefix(prefix) {
@@ -853,7 +1232,31 @@ impl HarnessConfig {
             self.profiles
                 .insert(DEFAULT_PROFILE.to_string(), default_profile());
         }
+        self.insert_builtin_mode_profiles();
         self
+    }
+
+    fn insert_builtin_mode_profiles(&mut self) {
+        let Some(base) = self.profiles.get(DEFAULT_PROFILE).cloned() else {
+            return;
+        };
+        if !looks_like_opencode_profile(&base) {
+            return;
+        }
+        if let Some(default) = self.profiles.get_mut(DEFAULT_PROFILE) {
+            default.backend = BackendKind::Opencode;
+            default.mode = Some(ProfileMode::Default);
+        }
+        self.profiles
+            .entry(ProfileMode::Local.as_str().to_string())
+            .or_insert_with(|| {
+                profile_with_forced_model(&base, ProfileMode::Local, "ollama/hermes3:claude")
+            });
+        self.profiles
+            .entry(ProfileMode::Cloud.as_str().to_string())
+            .or_insert_with(|| {
+                profile_with_forced_model(&base, ProfileMode::Cloud, "ollama/glm-4.7:cloud")
+            });
     }
 }
 
@@ -866,6 +1269,9 @@ fn default_config() -> HarnessConfig {
 fn default_profile() -> AgentProfile {
     AgentProfile {
         command: vec!["opencode".to_string(), "run".to_string()],
+        backend: BackendKind::Opencode,
+        mode: Some(ProfileMode::Default),
+        transport: StreamTransport::Line,
         bypass_args: vec!["--dangerously-skip-permissions".to_string()],
         desktop_args: vec!["--dangerously-skip-permissions".to_string()],
         desktop_prompt_prefix: Some(
@@ -879,6 +1285,46 @@ fn default_profile() -> AgentProfile {
         continue_args: Vec::new(),
         session_id_capture_prefix: None,
     }
+}
+
+fn looks_like_opencode_profile(profile: &AgentProfile) -> bool {
+    profile.backend == BackendKind::Opencode
+        || matches!(
+            profile.command.as_slice(),
+            [bin, subcommand, ..] if bin == "opencode" && subcommand == "run"
+        )
+}
+
+fn profile_with_forced_model(base: &AgentProfile, mode: ProfileMode, model: &str) -> AgentProfile {
+    let mut profile = base.clone();
+    profile.backend = BackendKind::Opencode;
+    profile.mode = Some(mode);
+    profile.command = with_forced_model_arg(&base.command, model);
+    profile
+}
+
+fn with_forced_model_arg(command: &[String], model: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(command.len() + 2);
+    let mut skip_next = false;
+    for (index, arg) in command.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if index >= 2 && (arg == "--model" || arg == "-m") {
+            skip_next = true;
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    if out.len() >= 2 {
+        out.insert(2, model.to_string());
+        out.insert(2, "--model".to_string());
+    } else {
+        out.push("--model".to_string());
+        out.push(model.to_string());
+    }
+    out
 }
 
 fn default_prompt_arg() -> bool {
@@ -1014,7 +1460,12 @@ fn strip_quotes(value: &str) -> &str {
     }
 }
 
-fn resolved_command(profile: &AgentProfile, prompt: &str, request: &RunRequest) -> Vec<String> {
+fn build_generic_command(
+    profile: &AgentProfile,
+    prompt: &str,
+    request: &RunRequest,
+    continue_args: &[String],
+) -> Vec<String> {
     let mut command = profile.command.clone();
     if request.bypass_permissions {
         command.extend(profile.bypass_args.clone());
@@ -1023,7 +1474,7 @@ fn resolved_command(profile: &AgentProfile, prompt: &str, request: &RunRequest) 
         command.extend(profile.desktop_args.clone());
     }
     if let Some(session_id) = request.provider_session_id.as_deref() {
-        for arg in &profile.continue_args {
+        for arg in continue_args {
             command.push(arg.replace("{session_id}", session_id));
         }
     }
@@ -1037,37 +1488,67 @@ async fn stream_pipe<R>(
     reader: R,
     path: PathBuf,
     kind: StreamKind,
+    profile: AgentProfile,
+    transport: StreamTransport,
     events: UnboundedSender<RunEvent>,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let adapter = backend_adapter(profile.backend);
     let mut file = fs::File::create(&path)
         .await
         .with_context(|| format!("failed to create {}", path.display()))?;
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::with_capacity(1024);
-    loop {
-        buf.clear();
-        let bytes = reader
-            .read_until(b'\n', &mut buf)
-            .await
-            .with_context(|| format!("failed to read {kind:?}"))?;
-        if bytes == 0 {
-            break;
-        }
-        file.write_all(&buf).await?;
-        let text = strip_trailing_newline(&buf);
-        let event = match kind {
-            StreamKind::Stdout => RunEvent::Stdout(text),
-            StreamKind::Stderr => RunEvent::Stderr(text),
-        };
-        if events.send(event).is_err() {
-            // Receiver dropped; keep draining to disk so the run record is
-            // complete, but no point allocating strings the caller will not
-            // see.
-            return drain_pipe(reader, &mut file).await;
-        }
+    match transport {
+        StreamTransport::Line => loop {
+            buf.clear();
+            let bytes = reader
+                .read_until(b'\n', &mut buf)
+                .await
+                .with_context(|| format!("failed to read {kind:?}"))?;
+            if bytes == 0 {
+                break;
+            }
+            file.write_all(&buf).await?;
+            let chunk = StreamChunk::from_bytes(&buf);
+            for backend_event in adapter.interpret_chunk(&profile, kind, &chunk) {
+                if events.send(RunEvent::Backend(backend_event)).is_err() {
+                    return drain_pipe(reader, &mut file).await;
+                }
+            }
+            let event = match kind {
+                StreamKind::Stdout => RunEvent::Stdout(chunk),
+                StreamKind::Stderr => RunEvent::Stderr(chunk),
+            };
+            if events.send(event).is_err() {
+                return drain_pipe(reader, &mut file).await;
+            }
+        },
+        StreamTransport::Raw => loop {
+            buf.resize(4096, 0);
+            let bytes = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
+                .await
+                .with_context(|| format!("failed to read {kind:?}"))?;
+            if bytes == 0 {
+                break;
+            }
+            file.write_all(&buf[..bytes]).await?;
+            let chunk = StreamChunk::from_bytes(&buf[..bytes]);
+            for backend_event in adapter.interpret_chunk(&profile, kind, &chunk) {
+                if events.send(RunEvent::Backend(backend_event)).is_err() {
+                    return drain_pipe(reader, &mut file).await;
+                }
+            }
+            let event = match kind {
+                StreamKind::Stdout => RunEvent::Stdout(chunk),
+                StreamKind::Stderr => RunEvent::Stderr(chunk),
+            };
+            if events.send(event).is_err() {
+                return drain_pipe(reader, &mut file).await;
+            }
+        },
     }
     Ok(())
 }
@@ -1087,12 +1568,26 @@ where
     Ok(())
 }
 
-fn strip_trailing_newline(bytes: &[u8]) -> String {
+fn split_trailing_newlines(bytes: &[u8]) -> (String, u8) {
     let mut end = bytes.len();
-    while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
-        end -= 1;
+    let mut trailing = 0_u8;
+    while end > 0 {
+        if end >= 2 && bytes[end - 2] == b'\r' && bytes[end - 1] == b'\n' {
+            trailing = trailing.saturating_add(1);
+            end -= 2;
+            continue;
+        }
+        if bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r' {
+            trailing = trailing.saturating_add(1);
+            end -= 1;
+            continue;
+        }
+        break;
     }
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
+    (
+        String::from_utf8_lossy(&bytes[..end]).into_owned(),
+        trailing,
+    )
 }
 
 async fn write_record(run_dir: &Path, record: &RunRecord) -> Result<()> {
@@ -1532,6 +2027,28 @@ pub fn doctor_counts(checks: &[DoctorCheck]) -> (usize, usize, usize) {
     counts
 }
 
+pub fn profile_mode_label(config: &HarnessConfig, profile_name: &str) -> &'static str {
+    config
+        .profiles
+        .get(profile_name)
+        .and_then(|profile| profile.mode)
+        .map(ProfileMode::as_str)
+        .unwrap_or("custom")
+}
+
+pub fn resolve_mode_profile<'a>(config: &'a HarnessConfig, mode: &str) -> Option<&'a str> {
+    let wanted = match mode {
+        "default" => ProfileMode::Default,
+        "local" => ProfileMode::Local,
+        "cloud" => ProfileMode::Cloud,
+        _ => return None,
+    };
+    config
+        .profiles
+        .iter()
+        .find_map(|(name, profile)| (profile.mode == Some(wanted)).then_some(name.as_str()))
+}
+
 /// Top-level doctor runner. Performs all checks and returns them in display
 /// order. Impure: touches the filesystem and reads PATH from the environment.
 pub async fn run_doctor(
@@ -1591,6 +2108,20 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn clipboard_types_detect_png() {
+        assert!(clipboard_types_contain_png(b"text/plain\nimage/png\n"));
+        assert!(!clipboard_types_contain_png(b"text/plain\nimage/jpeg\n"));
+        assert!(!clipboard_types_contain_png(b"\xff\xfe"));
+    }
+
+    #[test]
+    fn default_attachments_dir_lives_under_harness_root() -> Result<()> {
+        let dir = default_attachments_dir()?;
+        assert!(dir.ends_with(DEFAULT_ATTACHMENTS_DIR));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn runs_command_and_writes_record() -> Result<()> {
         let temp = TempDir::new()?;
@@ -1604,6 +2135,9 @@ mod tests {
                         "printf '%s' \"$1\"".to_string(),
                         "sh".to_string(),
                     ],
+                    backend: BackendKind::GenericCli,
+                    mode: None,
+                    transport: StreamTransport::Line,
                     bypass_args: Vec::new(),
                     desktop_args: Vec::new(),
                     desktop_prompt_prefix: None,
@@ -1652,6 +2186,9 @@ mod tests {
                         "printf 'one\\ntwo\\n'; printf 'oops\\n' 1>&2; printf 'three\\n'"
                             .to_string(),
                     ],
+                    backend: BackendKind::GenericCli,
+                    mode: None,
+                    transport: StreamTransport::Line,
                     bypass_args: Vec::new(),
                     desktop_args: Vec::new(),
                     desktop_prompt_prefix: None,
@@ -1698,23 +2235,23 @@ mod tests {
             .count();
         assert_eq!(started_count, 1, "expected exactly one Started event");
 
-        let stdout_lines: Vec<&str> = events
+        let stdout_lines: Vec<(&str, u8)> = events
             .iter()
             .filter_map(|event| match event {
-                RunEvent::Stdout(line) => Some(line.as_str()),
+                RunEvent::Stdout(chunk) => Some((chunk.text.as_str(), chunk.trailing_newlines)),
                 _ => None,
             })
             .collect();
-        assert_eq!(stdout_lines, vec!["one", "two", "three"]);
+        assert_eq!(stdout_lines, vec![("one", 1), ("two", 1), ("three", 1)]);
 
-        let stderr_lines: Vec<&str> = events
+        let stderr_lines: Vec<(&str, u8)> = events
             .iter()
             .filter_map(|event| match event {
-                RunEvent::Stderr(line) => Some(line.as_str()),
+                RunEvent::Stderr(chunk) => Some((chunk.text.as_str(), chunk.trailing_newlines)),
                 _ => None,
             })
             .collect();
-        assert_eq!(stderr_lines, vec!["oops"]);
+        assert_eq!(stderr_lines, vec![("oops", 1)]);
 
         let completed_count = events
             .iter()
@@ -1729,6 +2266,85 @@ mod tests {
             "one\ntwo\nthree\n"
         );
         assert_eq!(read_optional_string(&record.stderr_log).await?, "oops\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_transport_streams_partial_chunks() -> Result<()> {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("python3 not available; skipping raw-streaming test");
+            return Ok(());
+        }
+        let temp = TempDir::new()?;
+        let config = HarnessConfig {
+            profiles: BTreeMap::from([(
+                "default".to_string(),
+                AgentProfile {
+                    command: vec![
+                        "python3".to_string(),
+                        "-c".to_string(),
+                        "import sys, time; sys.stdout.write('one'); sys.stdout.flush(); time.sleep(0.05); sys.stdout.write('two\\n'); sys.stdout.flush()".to_string(),
+                    ],
+                    backend: BackendKind::GenericCli,
+                    mode: None,
+                    transport: StreamTransport::Raw,
+                    bypass_args: Vec::new(),
+                    desktop_args: Vec::new(),
+                    desktop_prompt_prefix: None,
+                    env: BTreeMap::new(),
+                    cwd: None,
+                    timeout_secs: Some(5),
+                    prompt_arg: false,
+                    continue_args: Vec::new(),
+                    session_id_capture_prefix: None,
+                },
+            )]),
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let record = run_agent_streaming(
+            &config,
+            temp.path(),
+            RunRequest {
+                profile: "default".to_string(),
+                prompt: "ignored".to_string(),
+                label: None,
+                cwd: None,
+                timeout_secs: None,
+                bypass_permissions: false,
+                desktop_control: false,
+                prompt_prefix: None,
+                provider_session_id: None,
+            },
+            tx,
+            None,
+        )
+        .await?;
+
+        let mut stdout_chunks = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let RunEvent::Stdout(chunk) = event {
+                stdout_chunks.push(chunk);
+            }
+        }
+
+        assert_eq!(record.status, RunStatus::Succeeded);
+        assert!(
+            stdout_chunks.len() >= 2,
+            "expected at least two raw chunks, got {stdout_chunks:?}"
+        );
+        let reconstructed = stdout_chunks.iter().fold(String::new(), |mut out, chunk| {
+            out.push_str(&chunk.text);
+            for _ in 0..chunk.trailing_newlines {
+                out.push('\n');
+            }
+            out
+        });
+        assert_eq!(reconstructed, "onetwo\n");
         Ok(())
     }
 
@@ -1861,6 +2477,9 @@ mod tests {
                         "for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done".to_string(),
                         "sh".to_string(),
                     ],
+                    backend: BackendKind::GenericCli,
+                    mode: None,
+                    transport: StreamTransport::Line,
                     bypass_args: Vec::new(),
                     desktop_args: Vec::new(),
                     desktop_prompt_prefix: None,
@@ -1907,6 +2526,9 @@ mod tests {
                         "-c".to_string(),
                         "printf 'session_id: xyz789\\nhello\\n'".to_string(),
                     ],
+                    backend: BackendKind::GenericCli,
+                    mode: None,
+                    transport: StreamTransport::Line,
                     bypass_args: Vec::new(),
                     desktop_args: Vec::new(),
                     desktop_prompt_prefix: None,
@@ -1947,6 +2569,9 @@ mod tests {
                 "default".to_string(),
                 AgentProfile {
                     command: vec!["sh".to_string(), "-c".to_string(), "sleep 2".to_string()],
+                    backend: BackendKind::GenericCli,
+                    mode: None,
+                    transport: StreamTransport::Line,
                     bypass_args: Vec::new(),
                     desktop_args: Vec::new(),
                     desktop_prompt_prefix: None,
@@ -2002,6 +2627,9 @@ mod tests {
                         // wedging the streaming reader.
                         "exec sleep 30".to_string(),
                     ],
+                    backend: BackendKind::GenericCli,
+                    mode: None,
+                    transport: StreamTransport::Line,
                     bypass_args: Vec::new(),
                     desktop_args: Vec::new(),
                     desktop_prompt_prefix: None,
@@ -2082,6 +2710,9 @@ mod tests {
                         "-c".to_string(),
                         "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)".to_string(),
                     ],
+                    backend: BackendKind::GenericCli,
+                    mode: None,
+                    transport: StreamTransport::Line,
                     bypass_args: Vec::new(),
                     desktop_args: Vec::new(),
                     desktop_prompt_prefix: None,
@@ -2158,6 +2789,9 @@ mod tests {
                         // signals via kill(-pgid)).
                         "sleep 30 & wait".to_string(),
                     ],
+                    backend: BackendKind::GenericCli,
+                    mode: None,
+                    transport: StreamTransport::Line,
                     bypass_args: Vec::new(),
                     desktop_args: Vec::new(),
                     desktop_prompt_prefix: None,
@@ -2222,6 +2856,9 @@ mod tests {
                         (*name).to_string(),
                         AgentProfile {
                             command: cmd.iter().map(|s| (*s).to_string()).collect(),
+                            backend: BackendKind::GenericCli,
+                            mode: None,
+                            transport: StreamTransport::Line,
                             bypass_args: Vec::new(),
                             desktop_args: Vec::new(),
                             desktop_prompt_prefix: None,
@@ -2244,6 +2881,176 @@ mod tests {
         let result = check_profile(&config, "default");
         assert_eq!(result.level, DoctorLevel::Ok);
         assert!(result.detail.contains("echo hi"));
+    }
+
+    #[test]
+    fn resolve_mode_profile_uses_profile_metadata() {
+        let config = HarnessConfig {
+            profiles: BTreeMap::from([
+                (
+                    "alpha".to_string(),
+                    AgentProfile {
+                        command: vec!["echo".to_string()],
+                        backend: BackendKind::GenericCli,
+                        mode: Some(ProfileMode::Cloud),
+                        transport: StreamTransport::Line,
+                        bypass_args: Vec::new(),
+                        desktop_args: Vec::new(),
+                        desktop_prompt_prefix: None,
+                        env: BTreeMap::new(),
+                        cwd: None,
+                        timeout_secs: None,
+                        prompt_arg: true,
+                        continue_args: Vec::new(),
+                        session_id_capture_prefix: None,
+                    },
+                ),
+                (
+                    "omega".to_string(),
+                    AgentProfile {
+                        command: vec!["echo".to_string()],
+                        backend: BackendKind::GenericCli,
+                        mode: Some(ProfileMode::Default),
+                        transport: StreamTransport::Line,
+                        bypass_args: Vec::new(),
+                        desktop_args: Vec::new(),
+                        desktop_prompt_prefix: None,
+                        env: BTreeMap::new(),
+                        cwd: None,
+                        timeout_secs: None,
+                        prompt_arg: true,
+                        continue_args: Vec::new(),
+                        session_id_capture_prefix: None,
+                    },
+                ),
+            ]),
+        };
+
+        assert_eq!(resolve_mode_profile(&config, "cloud"), Some("alpha"));
+        assert_eq!(resolve_mode_profile(&config, "default"), Some("omega"));
+        assert_eq!(profile_mode_label(&config, "alpha"), "cloud");
+        assert_eq!(profile_mode_label(&config, "missing"), "custom");
+    }
+
+    #[test]
+    fn profile_capabilities_reflect_continue_settings() {
+        let mut profile = bare_profile("echo");
+        assert!(!effective_profile_capabilities(&profile).supports_continue);
+        profile.continue_args = vec!["--session".to_string(), "{session_id}".to_string()];
+        assert!(effective_profile_capabilities(&profile).supports_continue);
+    }
+
+    #[test]
+    fn opencode_backend_supplies_default_continue_capability() {
+        let profile = AgentProfile {
+            command: vec!["opencode".to_string(), "run".to_string()],
+            backend: BackendKind::Opencode,
+            mode: Some(ProfileMode::Default),
+            transport: StreamTransport::Line,
+            bypass_args: Vec::new(),
+            desktop_args: Vec::new(),
+            desktop_prompt_prefix: None,
+            env: BTreeMap::new(),
+            cwd: None,
+            timeout_secs: None,
+            prompt_arg: true,
+            continue_args: Vec::new(),
+            session_id_capture_prefix: None,
+        };
+        assert!(effective_profile_capabilities(&profile).supports_continue);
+    }
+
+    #[tokio::test]
+    async fn extract_prefixed_session_id_returns_none_without_prefix() -> Result<()> {
+        let temp = TempDir::new()?;
+        let log = temp.path().join("stdout.log");
+        fs::write(&log, "session_id: abc123\n").await?;
+        assert_eq!(extract_prefixed_session_id(&log, None).await?, None);
+        assert_eq!(extract_prefixed_session_id(&log, Some("")).await?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn opencode_adapter_builds_command_through_backend_interface() {
+        let profile = AgentProfile {
+            command: vec!["opencode".to_string(), "run".to_string()],
+            backend: BackendKind::Opencode,
+            mode: Some(ProfileMode::Default),
+            transport: StreamTransport::Line,
+            bypass_args: vec!["--dangerously-skip-permissions".to_string()],
+            desktop_args: vec!["--desktop".to_string()],
+            desktop_prompt_prefix: None,
+            env: BTreeMap::new(),
+            cwd: None,
+            timeout_secs: None,
+            prompt_arg: true,
+            continue_args: vec!["--session".to_string(), "{session_id}".to_string()],
+            session_id_capture_prefix: Some("session: ".to_string()),
+        };
+        let request = RunRequest {
+            profile: "default".to_string(),
+            prompt: "hi".to_string(),
+            label: None,
+            cwd: None,
+            timeout_secs: None,
+            bypass_permissions: true,
+            desktop_control: false,
+            prompt_prefix: None,
+            provider_session_id: Some("abc123".to_string()),
+        };
+        let command = backend_adapter(profile.backend).build_command(&profile, "hi", &request);
+        assert_eq!(
+            command,
+            vec![
+                "opencode",
+                "run",
+                "--dangerously-skip-permissions",
+                "--session",
+                "abc123",
+                "hi",
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_adapter_emits_backend_events_for_progress_and_session_notice() {
+        let profile = AgentProfile {
+            command: vec!["opencode".to_string(), "run".to_string()],
+            backend: BackendKind::Opencode,
+            mode: Some(ProfileMode::Default),
+            transport: StreamTransport::Line,
+            bypass_args: Vec::new(),
+            desktop_args: Vec::new(),
+            desktop_prompt_prefix: None,
+            env: BTreeMap::new(),
+            cwd: None,
+            timeout_secs: None,
+            prompt_arg: true,
+            continue_args: Vec::new(),
+            session_id_capture_prefix: None,
+        };
+        let adapter = backend_adapter(profile.backend);
+        let progress = adapter.interpret_chunk(
+            &profile,
+            StreamKind::Stdout,
+            &StreamChunk {
+                text: "Build worker plan".to_string(),
+                trailing_newlines: 1,
+            },
+        );
+        assert!(progress.contains(&BackendEvent::Progress("Build worker plan".to_string())));
+
+        let notice = adapter.interpret_chunk(
+            &profile,
+            StreamKind::Stdout,
+            &StreamChunk {
+                text: "session: abc123".to_string(),
+                trailing_newlines: 1,
+            },
+        );
+        assert!(notice.contains(&BackendEvent::Notice(
+            "backend announced provider session id".to_string()
+        )));
     }
 
     #[test]
@@ -2284,6 +3091,9 @@ mod tests {
     fn check_command_binary_warns_for_relative_path() {
         let profile = AgentProfile {
             command: vec!["./scripts/run.sh".to_string()],
+            backend: BackendKind::GenericCli,
+            mode: None,
+            transport: StreamTransport::Line,
             bypass_args: Vec::new(),
             desktop_args: Vec::new(),
             desktop_prompt_prefix: None,
@@ -2302,6 +3112,9 @@ mod tests {
     fn check_command_binary_fails_for_missing_absolute_path() {
         let profile = AgentProfile {
             command: vec!["/no/such/binary-xyz".to_string()],
+            backend: BackendKind::GenericCli,
+            mode: None,
+            transport: StreamTransport::Line,
             bypass_args: Vec::new(),
             desktop_args: Vec::new(),
             desktop_prompt_prefix: None,
@@ -2321,6 +3134,9 @@ mod tests {
     fn bare_profile(name: &str) -> AgentProfile {
         AgentProfile {
             command: vec![name.to_string()],
+            backend: BackendKind::GenericCli,
+            mode: None,
+            transport: StreamTransport::Line,
             bypass_args: Vec::new(),
             desktop_args: Vec::new(),
             desktop_prompt_prefix: None,

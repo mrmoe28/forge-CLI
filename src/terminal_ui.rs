@@ -13,6 +13,7 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use crossterm::execute;
 use crossterm::terminal;
+use forge_cli::BackendEvent;
 use forge_cli::HarnessConfig;
 use forge_cli::JobSpec;
 use forge_cli::RunEvent;
@@ -22,15 +23,21 @@ use forge_cli::RunStatus;
 use forge_cli::Session;
 use forge_cli::SessionTurn;
 use forge_cli::Skill;
+use forge_cli::StreamChunk;
 use forge_cli::create_skill;
 use forge_cli::discover_skills;
 use forge_cli::doctor_counts;
+use forge_cli::effective_profile_capabilities;
 use forge_cli::find_run;
 use forge_cli::format_failure_guidance;
+use forge_cli::import_clipboard_image;
+use forge_cli::learning;
 use forge_cli::list_runs;
 use forge_cli::list_sessions;
 use forge_cli::load_session;
+use forge_cli::profile_mode_label;
 use forge_cli::read_transcript;
+use forge_cli::resolve_mode_profile;
 use forge_cli::run_agent_streaming;
 use forge_cli::run_doctor;
 use forge_cli::save_session;
@@ -81,6 +88,7 @@ pub async fn run_terminal_ui(
     session.timeout_secs = args.timeout_secs;
     save_session(&sessions_dir, &session).await?;
     let skills = discover_skills(&session.cwd).await?;
+    let accepted_learning = learning::list_accepted(&learning_dir).await?;
     let mut state = TuiState::new(
         config,
         session,
@@ -88,21 +96,29 @@ pub async fn run_terminal_ui(
         runs_dir,
         learning_dir,
         skills,
+        accepted_learning,
     );
+    let mut needs_redraw = true;
 
     loop {
-        terminal.draw(|frame| render(frame, &state))?;
+        if needs_redraw {
+            terminal.draw(|frame| render(frame, &state))?;
+            needs_redraw = false;
+        }
 
-        pump_active_run(&mut state).await;
+        needs_redraw |= pump_active_run(&mut state).await;
 
         let poll_ms = if state.active_run.is_some() { 33 } else { 100 };
         if event::poll(Duration::from_millis(poll_ms))? {
             match event::read()? {
                 Event::Key(key) if handle_key(&mut state, key) => break,
-                Event::Key(_) => {}
+                Event::Key(_) => {
+                    needs_redraw = true;
+                }
                 Event::Paste(text) => {
                     state.composer.insert_str(&text);
                     state.selected_suggestion = 0;
+                    needs_redraw = true;
                 }
                 _ => {}
             }
@@ -116,11 +132,13 @@ pub async fn run_terminal_ui(
                     } else {
                         start_run(&mut state, prompt);
                     }
+                    needs_redraw = true;
                 }
                 Action::Command(command) => {
                     if handle_command(&mut state, &command).await? {
                         break;
                     }
+                    needs_redraw = true;
                 }
             }
         }
@@ -136,6 +154,7 @@ struct TuiState {
     runs_dir: PathBuf,
     learning_dir: PathBuf,
     skills: Vec<Skill>,
+    accepted_learning: Vec<learning::LearnNote>,
     composer: Composer,
     status: String,
     transcript: Vec<TranscriptEntry>,
@@ -144,6 +163,7 @@ struct TuiState {
     selected_suggestion: usize,
     pending_action: Option<Action>,
     pending_approval: Option<PendingApproval>,
+    next_run_retry_source: Option<String>,
     active_run: Option<ActiveRun>,
 }
 
@@ -166,6 +186,7 @@ impl TuiState {
         runs_dir: PathBuf,
         learning_dir: PathBuf,
         skills: Vec<Skill>,
+        accepted_learning: Vec<learning::LearnNote>,
     ) -> Self {
         let transcript = vec![
             TranscriptEntry::system(format!("Forge — session {}", session.short_id())),
@@ -182,6 +203,7 @@ impl TuiState {
             runs_dir,
             learning_dir,
             skills,
+            accepted_learning,
             composer,
             status: "ready".to_string(),
             transcript,
@@ -190,6 +212,7 @@ impl TuiState {
             selected_suggestion: 0,
             pending_action: None,
             pending_approval: None,
+            next_run_retry_source: None,
             active_run: None,
         }
     }
@@ -265,9 +288,15 @@ struct ActiveRun {
     started_at: Instant,
     assistant_open: bool,
     error_open: bool,
-    /// Concatenated stdout lines, separated by `\n`, captured so the final
-    /// assistant turn can be persisted to the session transcript.
+    /// Concatenated stdout chunks, reconstructed with trailing newlines, so
+    /// the final assistant turn can be persisted to the session transcript.
     assistant_buffer: String,
+    /// Concatenated stderr chunks for auto-learning summaries.
+    error_buffer: String,
+    /// Guard so a noisy provider only emits one rate-limit hint per run.
+    rate_limit_noted: bool,
+    /// When this run came from `/retry`, the source run id.
+    retry_of: Option<String>,
     /// Fires graceful shutdown inside `run_agent_streaming`. Taken (and sent
     /// through) by `cancel_active_run`. `None` after the first send because
     /// `oneshot::Sender::send` consumes the sender; future cancel attempts
@@ -1019,6 +1048,10 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Char('c') if ctrl => true,
+        KeyCode::Char('v') if ctrl => {
+            paste_clipboard_image_into_composer(state);
+            false
+        }
         KeyCode::Char('d') if ctrl && state.composer.is_empty() => true,
         KeyCode::Esc => {
             // Esc cancels an in-flight run (keeping the TUI open). When no run
@@ -1521,6 +1554,7 @@ fn start_run(state: &mut TuiState, prompt: String) {
     let handle = tokio::spawn(async move {
         run_agent_streaming(&config, &runs_dir, request, tx, Some(cancel_rx)).await
     });
+    let retry_of = state.next_run_retry_source.take();
 
     state.active_run = Some(ActiveRun {
         handle,
@@ -1529,18 +1563,22 @@ fn start_run(state: &mut TuiState, prompt: String) {
         assistant_open: false,
         error_open: false,
         assistant_buffer: String::new(),
+        error_buffer: String::new(),
+        rate_limit_noted: false,
+        retry_of,
         cancel_tx: Some(cancel_tx),
         cancel_requested: false,
     });
 }
 
-async fn pump_active_run(state: &mut TuiState) {
+async fn pump_active_run(state: &mut TuiState) -> bool {
     if state.active_run.is_none() {
-        return;
+        return false;
     }
 
     let mut pending = Vec::new();
     let mut finished = false;
+    let mut changed = false;
     if let Some(active) = state.active_run.as_mut() {
         while let Ok(event) = active.rx.try_recv() {
             pending.push(event);
@@ -1550,10 +1588,12 @@ async fn pump_active_run(state: &mut TuiState) {
         }
     }
     for event in pending {
+        changed = true;
         apply_run_event(state, event);
     }
 
     if finished && let Some(active) = state.active_run.take() {
+        changed = true;
         match active.handle.await {
             Ok(Ok(record)) => {
                 state.last_run_id = Some(record.id.clone());
@@ -1584,6 +1624,36 @@ async fn pump_active_run(state: &mut TuiState) {
                     state.session.provider_session_id = Some(provider_id.clone());
                     state.push_system(format!("captured provider session id: {provider_id}"));
                 }
+                match learning::auto_capture_run(
+                    &state.learning_dir,
+                    learning::AutoLearnCapture {
+                        record: &record,
+                        prompt: &record.prompt,
+                        stdout: &active.assistant_buffer,
+                        stderr: &active.error_buffer,
+                        retry_of: active.retry_of.as_deref(),
+                    },
+                )
+                .await
+                {
+                    Ok(learning::AutoLearnOutcome::Saved(note)) => {
+                        state.push_system(format!("auto-learn: saved pending note {}", note.id));
+                    }
+                    Ok(learning::AutoLearnOutcome::Duplicate { existing_id }) => {
+                        state.push_system(format!("auto-learn: duplicate skipped ({existing_id})"));
+                    }
+                    Ok(
+                        learning::AutoLearnOutcome::Disabled | learning::AutoLearnOutcome::Skipped,
+                    ) => {}
+                    Err(err) => {
+                        state.push_entries([TranscriptEntry::error(format!(
+                            "auto-learn failed: {err}"
+                        ))]);
+                    }
+                }
+                if let Ok(accepted) = learning::list_accepted(&state.learning_dir).await {
+                    state.accepted_learning = accepted;
+                }
                 state
                     .session
                     .record_assistant(active.assistant_buffer, record.id.clone());
@@ -1605,6 +1675,7 @@ async fn pump_active_run(state: &mut TuiState) {
             }
         }
     }
+    changed
 }
 
 fn apply_run_event(state: &mut TuiState, event: RunEvent) {
@@ -1615,49 +1686,60 @@ fn apply_run_event(state: &mut TuiState, event: RunEvent) {
                 started.id.chars().take(8).collect::<String>()
             );
         }
-        RunEvent::Stdout(line) => {
-            if line.is_empty() {
-                return;
-            }
+        RunEvent::Backend(event) => match event {
+            BackendEvent::Notice(message) => state.push_system(format!("backend: {message}")),
+            BackendEvent::Progress(message) => state.status = format!("Backend: {message}"),
+        },
+        RunEvent::Stdout(chunk) => {
             let was_open = if let Some(active) = state.active_run.as_mut() {
                 let was = active.assistant_open;
                 active.assistant_open = true;
-                if !active.assistant_buffer.is_empty() {
-                    active.assistant_buffer.push('\n');
-                }
-                active.assistant_buffer.push_str(&line);
+                append_chunk(&mut active.assistant_buffer, &chunk);
                 was
             } else {
                 false
             };
+            if chunk.text.is_empty() {
+                return;
+            }
             if !was_open {
                 state.push_system("output: agent response");
             }
             let entry = if was_open {
-                TranscriptEntry::assistant_cont(line)
+                TranscriptEntry::assistant_cont(chunk.text)
             } else {
-                TranscriptEntry::assistant(line)
+                TranscriptEntry::assistant(chunk.text)
             };
             state.push_entries([entry]);
         }
-        RunEvent::Stderr(line) => {
-            if line.is_empty() {
-                return;
-            }
-            let was_open = if let Some(active) = state.active_run.as_mut() {
+        RunEvent::Stderr(chunk) => {
+            let (was_open, note_rate_limit) = if let Some(active) = state.active_run.as_mut() {
                 let was = active.error_open;
                 active.error_open = true;
-                was
+                append_chunk(&mut active.error_buffer, &chunk);
+                let note = !active.rate_limit_noted && looks_like_rate_limit(&chunk.text);
+                if note {
+                    active.rate_limit_noted = true;
+                }
+                (was, note)
             } else {
-                false
+                (false, false)
             };
+            if chunk.text.is_empty() {
+                return;
+            }
             if !was_open {
                 state.push_system("errors: agent stderr");
             }
+            if note_rate_limit {
+                state.push_system(
+                    "provider rate-limited (429); waiting for downstream retry/fallback",
+                );
+            }
             let entry = if was_open {
-                TranscriptEntry::error_cont(line)
+                TranscriptEntry::error_cont(chunk.text)
             } else {
-                TranscriptEntry::error(line)
+                TranscriptEntry::error(chunk.text)
             };
             state.push_entries([entry]);
         }
@@ -1667,6 +1749,21 @@ fn apply_run_event(state: &mut TuiState, event: RunEvent) {
             // consumers; the TUI ignores it.
         }
     }
+}
+
+fn append_chunk(buffer: &mut String, chunk: &StreamChunk) {
+    buffer.push_str(&chunk.text);
+    for _ in 0..chunk.trailing_newlines {
+        buffer.push('\n');
+    }
+}
+
+fn looks_like_rate_limit(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("ratelimiterror")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || (lower.contains("error code: 429"))
 }
 
 fn format_run_completion(record: &RunRecord) -> String {
@@ -1706,6 +1803,7 @@ pub(crate) const TUI_DISPATCHED_COMMANDS: &[&str] = &[
     "help",
     "skills",
     "skill",
+    "mode",
     "bypass",
     "desktop",
     "clear",
@@ -1729,6 +1827,7 @@ pub(crate) const TUI_DISPATCHED_COMMANDS: &[&str] = &[
     "logs",
     "export",
     "provider",
+    "paste-image",
     "jobs",
     "spawn",
     "doctor",
@@ -1914,6 +2013,24 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             state.push_entries(entries);
             Ok(false)
         }
+        "mode" => {
+            let Some(mode) = parts.next() else {
+                state.push_system(format!(
+                    "mode: {} (profile: {})",
+                    profile_mode_label(&state.config, &state.session.profile),
+                    state.session.profile
+                ));
+                return Ok(false);
+            };
+            let Some(target_profile) = resolve_mode_profile(&state.config, mode) else {
+                state.status = format!("Mode `{mode}` is unavailable for the current config");
+                return Ok(false);
+            };
+            state.session.profile = target_profile.to_string();
+            let _ = save_session(&state.sessions_dir, &state.session).await;
+            state.status = format!("mode: {mode} (profile: {})", state.session.profile);
+            Ok(false)
+        }
         "runs" => {
             let runs = list_runs(&state.runs_dir).await?;
             let entries: Vec<_> = runs
@@ -1964,6 +2081,7 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
                 state.status = "No matching run found".to_string();
                 return Ok(false);
             };
+            state.next_run_retry_source = Some(record.id.clone());
             start_run(state, record.prompt);
             Ok(false)
         }
@@ -1981,6 +2099,7 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             state.session = next;
             state.last_run_id = None;
             state.skills = discover_skills(&state.session.cwd).await?;
+            state.accepted_learning = learning::list_accepted(&state.learning_dir).await?;
             state.sync_after_session_swap();
             state.status = format!("New session {}", state.session.short_id());
             Ok(false)
@@ -2038,6 +2157,7 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             state.session = next;
             state.last_run_id = state.session.run_ids.last().cloned();
             state.skills = discover_skills(&state.session.cwd).await?;
+            state.accepted_learning = learning::list_accepted(&state.learning_dir).await?;
             state.sync_after_session_swap();
             state.status = format!("Resumed {}", state.session.short_id());
             Ok(false)
@@ -2057,6 +2177,7 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             state.session = fork;
             state.last_run_id = state.session.run_ids.last().cloned();
             state.skills = discover_skills(&state.session.cwd).await?;
+            state.accepted_learning = learning::list_accepted(&state.learning_dir).await?;
             state.sync_after_session_swap();
             state.status = format!("Forked {}", state.session.short_id());
             Ok(false)
@@ -2075,6 +2196,10 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
                     state.session.turn_count()
                 )),
                 TranscriptEntry::system(format!("profile: {}", state.session.profile)),
+                TranscriptEntry::system(format!(
+                    "agent mode: {}",
+                    profile_mode_label(&state.config, &state.session.profile)
+                )),
                 TranscriptEntry::system(format!("cwd: {}", state.session.cwd.display())),
                 TranscriptEntry::system(format!("mode: {mode}")),
                 TranscriptEntry::system(format!("active skills: {skills}")),
@@ -2246,6 +2371,17 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             Ok(false)
         }
         "provider" => {
+            let supports_continue = state
+                .config
+                .profiles
+                .get(&state.session.profile)
+                .map(|profile| effective_profile_capabilities(profile).supports_continue)
+                .unwrap_or(false);
+            if !supports_continue {
+                state.status =
+                    "Active profile does not declare session continuation support".to_string();
+                return Ok(false);
+            }
             match parts.next() {
                 None | Some("show") => {
                     let msg = match &state.session.provider_session_id {
@@ -2404,6 +2540,10 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             state.status = format!("spawn done: {succeeded}/{count} succeeded, {failed} failed");
             Ok(false)
         }
+        "paste-image" => {
+            paste_clipboard_image_into_composer(state);
+            Ok(false)
+        }
         "learn" => {
             let args: Vec<&str> = parts.collect();
             let lines = forge_cli::learning::handle_command(&state.learning_dir, &args).await;
@@ -2416,12 +2556,34 @@ async fn handle_command(state: &mut TuiState, command: &str) -> Result<bool> {
             if let Some(first) = lines.first() {
                 state.status = first.clone();
             }
+            state.accepted_learning = learning::list_accepted(&state.learning_dir).await?;
             state.push_entries(entries);
             Ok(false)
         }
         unknown => {
             state.status = format!("Unknown command: /{unknown}");
             Ok(false)
+        }
+    }
+}
+
+fn paste_clipboard_image_into_composer(state: &mut TuiState) {
+    let attachments_dir = state.session.cwd.join(forge_cli::DEFAULT_ATTACHMENTS_DIR);
+    match import_clipboard_image(&attachments_dir) {
+        Ok(path) => {
+            let absolute = path.canonicalize().unwrap_or(path);
+            if !state.composer.is_empty() && !state.composer.text().ends_with('\n') {
+                state.composer.insert_str("\n");
+            }
+            state.composer.insert_str(&format!(
+                "Please inspect this screenshot: {}",
+                absolute.display()
+            ));
+            state.selected_suggestion = 0;
+            state.status = format!("Pasted screenshot: {}", absolute.display());
+        }
+        Err(err) => {
+            state.status = format!("Clipboard image import failed: {err}");
         }
     }
 }
@@ -2469,6 +2631,7 @@ fn on_off(value: bool) -> &'static str {
 /// Skills with no triggers and that aren't activated are *not* injected, so
 /// the prompt no longer balloons with every discovered SKILL.md.
 fn active_skill_prompt_for(state: &TuiState, user_prompt: &str) -> Option<String> {
+    let mut sections: Vec<String> = Vec::new();
     let mut chosen: Vec<&Skill> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for name in &state.session.active_skills {
@@ -2483,18 +2646,25 @@ fn active_skill_prompt_for(state: &TuiState, user_prompt: &str) -> Option<String
             chosen.push(skill);
         }
     }
-    if chosen.is_empty() {
-        return None;
+    if let Some(notes_prompt) = learning::accepted_notes_prompt(&state.accepted_learning, 8) {
+        sections.push(notes_prompt);
     }
-    let mut prompt = String::from("Use the following active skills for this request:\n");
-    for skill in chosen {
-        prompt.push_str("\n--- skill: ");
-        prompt.push_str(&skill.name);
-        prompt.push_str(" ---\n");
-        prompt.push_str(&skill.body);
-        prompt.push('\n');
+    if !chosen.is_empty() {
+        let mut prompt = String::from("Use the following active skills for this request:\n");
+        for skill in chosen {
+            prompt.push_str("\n--- skill: ");
+            prompt.push_str(&skill.name);
+            prompt.push_str(" ---\n");
+            prompt.push_str(&skill.body);
+            prompt.push('\n');
+        }
+        sections.push(prompt);
     }
-    Some(prompt)
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n"))
+    }
 }
 
 fn render_record(record: &forge_cli::RunRecord, transcript: String) -> Vec<TranscriptEntry> {
@@ -2825,10 +2995,7 @@ mod tests {
         // ActiveRun slot in place so `pump_active_run` can render the
         // eventual Cancelled record naturally.
         let (_tx, rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(async {
-            std::future::pending::<()>().await;
-            Ok::<forge_cli::RunRecord, anyhow::Error>(unreachable!())
-        });
+        let handle = tokio::spawn(std::future::pending::<Result<forge_cli::RunRecord>>());
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let mut active_run = Some(ActiveRun {
             handle,
@@ -2837,6 +3004,9 @@ mod tests {
             assistant_open: false,
             error_open: false,
             assistant_buffer: String::new(),
+            error_buffer: String::new(),
+            rate_limit_noted: false,
+            retry_of: None,
             cancel_tx: Some(cancel_tx),
             cancel_requested: false,
         });
@@ -2876,10 +3046,7 @@ mod tests {
         // Second press while `cancel_requested` is already set escalates to
         // a hard abort (drops the kill_on_drop child → SIGKILL).
         let (_tx, rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(async {
-            std::future::pending::<()>().await;
-            Ok::<forge_cli::RunRecord, anyhow::Error>(unreachable!())
-        });
+        let handle = tokio::spawn(std::future::pending::<Result<forge_cli::RunRecord>>());
         let mut active_run = Some(ActiveRun {
             handle,
             rx,
@@ -2887,6 +3054,9 @@ mod tests {
             assistant_open: false,
             error_open: false,
             assistant_buffer: String::new(),
+            error_buffer: String::new(),
+            rate_limit_noted: false,
+            retry_of: None,
             cancel_tx: None,
             cancel_requested: true,
         });
@@ -2912,10 +3082,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_notes_partial_output_when_streams_were_open() {
         let (_tx, rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(async {
-            std::future::pending::<()>().await;
-            Ok::<forge_cli::RunRecord, anyhow::Error>(unreachable!())
-        });
+        let handle = tokio::spawn(std::future::pending::<Result<forge_cli::RunRecord>>());
         let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let mut active_run = Some(ActiveRun {
             handle,
@@ -2924,6 +3091,9 @@ mod tests {
             assistant_open: true,
             error_open: false,
             assistant_buffer: "partial response so far".to_string(),
+            error_buffer: String::new(),
+            rate_limit_noted: false,
+            retry_of: None,
             cancel_tx: Some(cancel_tx),
             cancel_requested: false,
         });

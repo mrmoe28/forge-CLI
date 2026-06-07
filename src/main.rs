@@ -3,6 +3,7 @@ use anyhow::Result;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
+use forge_cli::BackendEvent;
 use forge_cli::HarnessConfig;
 use forge_cli::RunEvent;
 use forge_cli::RunRecord;
@@ -11,11 +12,16 @@ use forge_cli::RunStatus;
 use forge_cli::Skill;
 use forge_cli::default_runs_dir;
 use forge_cli::discover_skills;
+use forge_cli::effective_profile_capabilities;
 use forge_cli::find_run;
+use forge_cli::import_clipboard_image;
+use forge_cli::learning;
 use forge_cli::list_runs;
 use forge_cli::load_config;
+use forge_cli::profile_mode_label;
 use forge_cli::read_jobs;
 use forge_cli::read_transcript;
+use forge_cli::resolve_mode_profile;
 use forge_cli::run_agent_streaming;
 use forge_cli::run_jobs;
 use std::io::IsTerminal;
@@ -329,11 +335,13 @@ async fn interactive_loop(
     session.timeout_secs = args.timeout_secs;
     forge_cli::save_session(&sessions_dir, &session).await?;
     let skills = discover_skills(&session.cwd).await?;
+    let accepted_learning = learning::list_accepted(&learning_dir).await?;
     let mut plain = PlainState {
         session,
         sessions_dir,
         learning_dir,
         skills,
+        accepted_learning,
         last_run_id: None,
     };
 
@@ -344,7 +352,7 @@ async fn interactive_loop(
         plain.session.profile
     );
     println!(
-        "commands: /help, /profile <name>, /skills, /skill <name>, /bypass on|off, /desktop on|off, /runs, /last, /retry [id], /new, /sessions, /resume [id], /fork [id], /exit"
+        "commands: /help, /profile <name>, /skills, /skill <name>, /paste-image, /bypass on|off, /desktop on|off, /runs, /last, /retry [id], /new, /sessions, /resume [id], /fork [id], /exit"
     );
 
     loop {
@@ -400,6 +408,7 @@ async fn interactive_loop(
                 prompt_prefix: active_skill_prompt(
                     &plain.skills,
                     &plain.session.active_skills,
+                    &plain.accepted_learning,
                     input,
                 ),
                 provider_session_id: plain.session.provider_session_id.clone(),
@@ -413,9 +422,20 @@ async fn interactive_loop(
             plain.session.provider_session_id = Some(id.clone());
             println!("captured provider session id: {id}");
         }
+        let (stdout_text, stderr_text) = read_transcript_parts(&record).await?;
+        maybe_auto_learn(
+            &plain.learning_dir,
+            &mut plain.accepted_learning,
+            &record,
+            input,
+            &stdout_text,
+            &stderr_text,
+            None,
+        )
+        .await?;
         plain
             .session
-            .record_assistant(read_transcript_text(&record).await?, record.id.clone());
+            .record_assistant(stdout_text, record.id.clone());
         forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
         print_run(&record);
     }
@@ -426,13 +446,14 @@ struct PlainState {
     sessions_dir: PathBuf,
     learning_dir: PathBuf,
     skills: Vec<Skill>,
+    accepted_learning: Vec<learning::LearnNote>,
     last_run_id: Option<String>,
 }
 
 /// Read just the stdout portion of a completed run so it can be stored on the
 /// session transcript as the assistant turn. The on-disk format from
 /// [`read_transcript`] also includes stderr, which we drop.
-async fn read_transcript_text(record: &forge_cli::RunRecord) -> Result<String> {
+async fn read_transcript_parts(record: &forge_cli::RunRecord) -> Result<(String, String)> {
     let body = read_transcript(record).await?;
     let stdout = body
         .strip_prefix("stdout:\n")
@@ -442,7 +463,14 @@ async fn read_transcript_text(record: &forge_cli::RunRecord) -> Result<String> {
                 .or(Some(rest))
         })
         .unwrap_or(body.as_str());
-    Ok(stdout.trim_end_matches('\n').to_string())
+    let stderr = body
+        .strip_prefix("stdout:\n")
+        .and_then(|rest| rest.split_once("\n\nstderr:\n").map(|(_, b)| b))
+        .unwrap_or("");
+    Ok((
+        stdout.trim_end_matches('\n').to_string(),
+        stderr.trim_end_matches('\n').to_string(),
+    ))
 }
 
 /// Canonical command names that `handle_interactive_command` dispatches in
@@ -455,6 +483,7 @@ pub(crate) const PLAIN_DISPATCHED_COMMANDS: &[&str] = &[
     "help",
     "profile",
     "profiles",
+    "mode",
     "skills",
     "skill",
     "bypass",
@@ -471,6 +500,7 @@ pub(crate) const PLAIN_DISPATCHED_COMMANDS: &[&str] = &[
     "permissions",
     "compact",
     "provider",
+    "paste-image",
     "clear",
     "doctor",
     "learn",
@@ -522,6 +552,24 @@ async fn handle_interactive_command(
             for name in config.profiles.keys() {
                 println!("{name}");
             }
+            Ok(false)
+        }
+        "mode" => {
+            let Some(mode) = parts.next() else {
+                println!(
+                    "mode: {} (profile: {})",
+                    profile_mode_label(config, &plain.session.profile),
+                    plain.session.profile
+                );
+                return Ok(false);
+            };
+            let Some(target_profile) = resolve_mode_profile(config, mode) else {
+                println!("mode `{mode}` is unavailable for the current config");
+                return Ok(false);
+            };
+            plain.session.profile = target_profile.to_string();
+            forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
+            println!("mode: {} (profile: {})", mode, plain.session.profile);
             Ok(false)
         }
         "skills" => {
@@ -616,8 +664,13 @@ async fn handle_interactive_command(
                 return Ok(false);
             };
             plain.session.record_user(record.prompt.clone());
-            let prompt_prefix =
-                active_skill_prompt(&plain.skills, &plain.session.active_skills, &record.prompt);
+            let prompt_prefix = active_skill_prompt(
+                &plain.skills,
+                &plain.session.active_skills,
+                &plain.accepted_learning,
+                &record.prompt,
+            );
+            let retry_of = record.id.clone();
             let retry = run_with_live_output(
                 config,
                 runs_dir,
@@ -641,9 +694,20 @@ async fn handle_interactive_command(
                 plain.session.provider_session_id = Some(id.clone());
                 println!("captured provider session id: {id}");
             }
+            let (stdout_text, stderr_text) = read_transcript_parts(&retry).await?;
+            maybe_auto_learn(
+                &plain.learning_dir,
+                &mut plain.accepted_learning,
+                &retry,
+                &retry.prompt,
+                &stdout_text,
+                &stderr_text,
+                Some(&retry_of),
+            )
+            .await?;
             plain
                 .session
-                .record_assistant(read_transcript_text(&retry).await?, retry.id.clone());
+                .record_assistant(stdout_text, retry.id.clone());
             forge_cli::save_session(&plain.sessions_dir, &plain.session).await?;
             print_run(&retry);
             Ok(false)
@@ -659,6 +723,7 @@ async fn handle_interactive_command(
             plain.session = next;
             plain.last_run_id = None;
             plain.skills = discover_skills(&plain.session.cwd).await?;
+            plain.accepted_learning = learning::list_accepted(&plain.learning_dir).await?;
             println!("new session: {}", plain.session.short_id());
             Ok(false)
         }
@@ -708,6 +773,7 @@ async fn handle_interactive_command(
             plain.session = next;
             plain.last_run_id = plain.session.run_ids.last().cloned();
             plain.skills = discover_skills(&plain.session.cwd).await?;
+            plain.accepted_learning = learning::list_accepted(&plain.learning_dir).await?;
             println!(
                 "resumed {} ({} turns)",
                 plain.session.short_id(),
@@ -726,6 +792,7 @@ async fn handle_interactive_command(
             plain.session = fork;
             plain.last_run_id = plain.session.run_ids.last().cloned();
             plain.skills = discover_skills(&plain.session.cwd).await?;
+            plain.accepted_learning = learning::list_accepted(&plain.learning_dir).await?;
             println!("forked {}", plain.session.short_id());
             Ok(false)
         }
@@ -747,6 +814,10 @@ async fn handle_interactive_command(
                 plain.session.turn_count()
             );
             println!("profile: {}", plain.session.profile);
+            println!(
+                "agent mode: {}",
+                profile_mode_label(config, &plain.session.profile)
+            );
             println!("cwd: {}", plain.session.cwd.display());
             println!("mode: {mode}");
             println!("active skills: {skills}");
@@ -827,6 +898,15 @@ async fn handle_interactive_command(
             Ok(false)
         }
         "provider" => {
+            let supports_continue = config
+                .profiles
+                .get(&plain.session.profile)
+                .map(|profile| effective_profile_capabilities(profile).supports_continue)
+                .unwrap_or(false);
+            if !supports_continue {
+                println!("active profile does not declare session continuation support");
+                return Ok(false);
+            }
             match parts.next() {
                 None | Some("show") => match &plain.session.provider_session_id {
                     Some(id) => println!("provider session id: {id}"),
@@ -850,6 +930,17 @@ async fn handle_interactive_command(
             }
             Ok(false)
         }
+        "paste-image" => {
+            let attachments_dir = plain.session.cwd.join(forge_cli::DEFAULT_ATTACHMENTS_DIR);
+            match import_clipboard_image(&attachments_dir) {
+                Ok(path) => {
+                    let absolute = path.canonicalize().unwrap_or(path);
+                    println!("{}", absolute.display());
+                }
+                Err(err) => println!("clipboard image import failed: {err}"),
+            }
+            Ok(false)
+        }
         "clear" => {
             // ANSI clear + cursor home. Works in any VT100-ish terminal.
             print!("\x1b[2J\x1b[H");
@@ -861,6 +952,7 @@ async fn handle_interactive_command(
             for line in forge_cli::learning::handle_command(&plain.learning_dir, &args).await {
                 println!("{line}");
             }
+            plain.accepted_learning = learning::list_accepted(&plain.learning_dir).await?;
             Ok(false)
         }
         cmd @ ("cancel" | "smoke" | "inspect" | "open-run" | "logs" | "export" | "jobs"
@@ -894,8 +986,10 @@ fn on_off(value: bool) -> &'static str {
 fn active_skill_prompt(
     skills: &[Skill],
     active_skills: &[String],
+    accepted_learning: &[learning::LearnNote],
     user_prompt: &str,
 ) -> Option<String> {
+    let mut sections: Vec<String> = Vec::new();
     let mut chosen: Vec<&Skill> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for name in active_skills {
@@ -910,18 +1004,25 @@ fn active_skill_prompt(
             chosen.push(skill);
         }
     }
-    if chosen.is_empty() {
-        return None;
+    if let Some(notes_prompt) = learning::accepted_notes_prompt(accepted_learning, 8) {
+        sections.push(notes_prompt);
     }
-    let mut prompt = String::from("Use the following active skills for this request:\n");
-    for skill in chosen {
-        prompt.push_str("\n--- skill: ");
-        prompt.push_str(&skill.name);
-        prompt.push_str(" ---\n");
-        prompt.push_str(&skill.body);
-        prompt.push('\n');
+    if !chosen.is_empty() {
+        let mut prompt = String::from("Use the following active skills for this request:\n");
+        for skill in chosen {
+            prompt.push_str("\n--- skill: ");
+            prompt.push_str(&skill.name);
+            prompt.push_str(" ---\n");
+            prompt.push_str(&skill.body);
+            prompt.push('\n');
+        }
+        sections.push(prompt);
     }
-    Some(prompt)
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n"))
+    }
 }
 
 async fn find_retry_source(
@@ -956,6 +1057,39 @@ async fn print_transcript(record: &forge_cli::RunRecord) -> Result<()> {
     Ok(())
 }
 
+async fn maybe_auto_learn(
+    learning_dir: &std::path::Path,
+    accepted_learning: &mut Vec<learning::LearnNote>,
+    record: &forge_cli::RunRecord,
+    prompt: &str,
+    stdout: &str,
+    stderr: &str,
+    retry_of: Option<&str>,
+) -> Result<()> {
+    match learning::auto_capture_run(
+        learning_dir,
+        learning::AutoLearnCapture {
+            record,
+            prompt,
+            stdout,
+            stderr,
+            retry_of,
+        },
+    )
+    .await?
+    {
+        learning::AutoLearnOutcome::Saved(note) => {
+            println!("auto-learn: saved pending note {}", note.id);
+        }
+        learning::AutoLearnOutcome::Duplicate { existing_id } => {
+            println!("auto-learn: duplicate skipped ({existing_id})");
+        }
+        learning::AutoLearnOutcome::Disabled | learning::AutoLearnOutcome::Skipped => {}
+    }
+    *accepted_learning = learning::list_accepted(learning_dir).await?;
+    Ok(())
+}
+
 fn status_to_result(status: RunStatus) -> Result<()> {
     match status {
         RunStatus::Succeeded => Ok(()),
@@ -987,8 +1121,28 @@ async fn run_with_live_output(
     while let Some(event) = rx.recv().await {
         match event {
             RunEvent::Started(_) => {}
-            RunEvent::Stdout(line) => println!("{line}"),
-            RunEvent::Stderr(line) => eprintln!("{line}"),
+            RunEvent::Backend(event) => match event {
+                BackendEvent::Notice(message) => eprintln!("backend: {message}"),
+                BackendEvent::Progress(message) => eprintln!("backend progress: {message}"),
+            },
+            RunEvent::Stdout(chunk) => {
+                print!("{}", chunk.text);
+                for _ in 0..chunk.trailing_newlines {
+                    println!();
+                }
+                if chunk.trailing_newlines == 0 {
+                    std::io::stdout().flush().ok();
+                }
+            }
+            RunEvent::Stderr(chunk) => {
+                eprint!("{}", chunk.text);
+                for _ in 0..chunk.trailing_newlines {
+                    eprintln!();
+                }
+                if chunk.trailing_newlines == 0 {
+                    std::io::stderr().flush().ok();
+                }
+            }
             RunEvent::Completed(_) => {}
         }
     }

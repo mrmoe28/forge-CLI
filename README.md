@@ -13,6 +13,9 @@ Wraps the underlying agent subprocess with:
 - a multi-line composer with bracketed paste, prompt history, full cursor
   & word/line edits, plus a small border chip (` path ` / ` unknown `)
   showing how Enter will route the current text
+- clipboard screenshot import via `Ctrl+V` or `/paste-image`, which saves
+  a PNG under `.codex/external-agent-harness/attachments/` and inserts a
+  prompt reference the downstream agent can read
 - a fuzzy slash-command palette with categorized commands and detail panel
 - structured run transcript markers (`thinking:`, `output:`, `errors:`,
   `done:` / `failed:`) so streamed agent output is easier to scan
@@ -65,6 +68,9 @@ Pass a TOML config with `--config`. Minimal example:
 ```toml
 [profiles.default]
 command = ["opencode", "run"]
+backend = "opencode"
+mode = "default"
+transport = "line"   # or "raw" for backends that stream partial chunks
 prompt_arg = true
 timeout_secs = 600
 bypass_args = ["--dangerously-skip-permissions"]
@@ -73,6 +79,8 @@ session_id_capture_prefix = "session: "
 ```
 
 Without `--config`, forge uses a default profile that runs `opencode run`.
+When that base profile is in use, forge also exposes built-in `local` and
+`cloud` profiles plus a `/mode` command for switching between them quickly.
 
 State lives under `.codex/external-agent-harness/{runs,sessions,learning}/`
 in the current working directory by default; override with `--runs-dir`,
@@ -262,6 +270,9 @@ except `command`:
 | Field | Purpose |
 |---|---|
 | `command` | Base argv. e.g. `["opencode", "run"]` |
+| `backend` | Backend family. Today: `generic_cli` or `opencode`. Used for capability defaults and backend-specific conveniences. |
+| `mode` | Optional profile variant tag: `default`, `local`, or `cloud`. `/mode` switches by this metadata, not by profile name. |
+| `transport` | How forge reads stdout/stderr: `line` for newline-delimited CLIs, `raw` for partial-chunk/token streaming |
 | `prompt_arg` | If true, append the user prompt as a positional arg |
 | `bypass_args` | Args appended when `/bypass on` |
 | `desktop_args` | Args appended when `/desktop on` |
@@ -271,6 +282,8 @@ except `command`:
 | `timeout_secs` | Hard limit; expires kill the child |
 | `continue_args` | Appended when the session has a captured id. `{session_id}` is substituted. Example: `["--session", "{session_id}"]` |
 | `session_id_capture_prefix` | Forge scans the run's stdout for a line starting with this prefix and stores the remainder as the provider session id |
+
+With the built-in opencode defaults, forge marks the base profile as `mode = "default"` and auto-creates `local` / `cloud` variants that force the configured model argument. Other backends can opt into `/mode` by tagging profiles with those mode values explicitly.
 
 ### Sessions vs run records
 
@@ -426,10 +439,11 @@ runs where the user has already opted into `/bypass on` or `/desktop on`.
 
 ### Explicit learning
 
-`/learn` is a small, manual note store for things the user explicitly wants
-forge to remember. It does **not** scrape transcripts, generate summaries,
-write prompts automatically, or inject accepted notes into future agent runs.
-Everything starts with a user-typed command.
+`/learn` is a small note store for things forge should remember. You can save
+notes explicitly, and forge now also auto-captures concise pending notes from
+completed runs so successes and failures can be reviewed instead of vanishing
+into logs. Only accepted notes are injected into future agent runs. `/learn off`
+disables both manual and automatic saves.
 
 Default storage:
 
@@ -447,7 +461,7 @@ Useful commands:
 | Command | Effect |
 |---|---|
 | `/learn` or `/learn status` | Show storage path, note counts, and disabled flag |
-| `/learn save <note>` | Write a pending Markdown note |
+| `/learn save <note>` | Write a pending Markdown note manually |
 | `/learn review` | List pending notes with ids and previews |
 | `/learn accept <id>` | Move a pending note to accepted |
 | `/learn reject <id>` | Move a pending note to rejected |
@@ -465,9 +479,10 @@ and reject path-like characters before touching the filesystem.
 The streaming path is what makes the TUI feel live. Two design choices
 matter:
 
-- **Line-buffered**, not byte-buffered. `BufReader::read_until('\n')`
-  preserves line boundaries when echoing to the transcript and to
-  `stdout.log`. Partial trailing output on EOF is still delivered.
+- **Profile-selected transport**. `transport = "line"` uses
+  `BufReader::read_until('\n')`; `transport = "raw"` reads arbitrary chunks
+  and forwards them immediately so models that do not flush newline-delimited
+  output still appear live.
 - **Unbounded channel**. `mpsc::unbounded_channel<RunEvent>` means the
   agent never blocks on a slow TUI redraw. The TUI drains with
   `try_recv` once per frame.
@@ -500,13 +515,14 @@ accidental process storms.
 | `src/terminal_ui.rs` | Ratatui TUI: state, render loop, key handling, approval card, suggestion picker |
 | `src/composer.rs` | Multi-line composer (cursor, history, paste, word-level edits) |
 | `src/commands.rs` | Slash command registry, categories, fuzzy matcher, input classifier (`InputClass`, `classify_input`) shared by the TUI and the REPL |
-| `src/learning.rs` | Explicit `/learn` storage: pending/accepted/rejected notes, review/show/forget, disabled marker, events log |
+| `src/learning.rs` | Learning storage: pending/accepted/rejected notes, auto-captured run lessons, review/show/forget, disabled marker, events log |
 
 ## Status
 
 Built and tested on Linux with Rust stable. The TUI uses bracketed paste,
 which most modern terminals support; pasting falls back to per-keystroke
-events if the terminal doesn't.
+events if the terminal doesn't. Screenshot import currently depends on a
+clipboard helper being available (`wl-paste`, `xclip`, or `pngpaste`).
 
 ## License
 
